@@ -1,0 +1,19 @@
+/build/
+/dist/
+/vendor/
+*.user
+*.log
+/artifacts/
+# Older local RF-scope snapshots are superseded by the integrated src/ and web/ files.
+/experiments/
+
+# CMake/Ninja generated files
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/build.ninja
+**/.ninja_deps
+**/.ninja_log
+
+# FTDI runtime binaries are downloaded separately and must not be committed
+/runtime/ftdi/*.dll
