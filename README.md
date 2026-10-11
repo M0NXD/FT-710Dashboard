@@ -1,6 +1,10 @@
-# FT-710 Dashboard — M0NXD
+# FT-710 Dashboard — Remote Control for Yaesu FT-710
 
-A native Windows C++20 FT-710 station dashboard with an embedded web interface. One application provides direct serial radio control through Hamlib, USB RF spectrum and waterfall, received-audio scope, routed audio, CAT sharing, and phone/browser access. Version **2.0.4** uses HTTPS for browser control and two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.4** also provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+
+## Remote control at a glance
+
+The dashboard serves its authenticated web interface on port **8888**. Open **Web: 8888** in the desktop app to get the station address and access code, then complete the certificate setup if using Safari. Browser controls share the desktop app's live radio connection; the FT-710 stays attached to the station PC by USB. See [Web dashboard and phone audio](#web-dashboard-and-phone-audio) for setup instructions.
 
 ### Runtime dependencies
 
