@@ -1,6 +1,10 @@
 # FT-710 Dashboard — M0NXD
 
-A native Windows C++20 FT-710 station dashboard with an embedded web interface. One application provides direct serial radio control through Hamlib, USB RF spectrum and waterfall, received-audio scope, routed audio, CAT sharing, and phone/browser access. Version **2.0.4** uses HTTPS for browser control and two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The portable application is `dist/FT710Dashboard.exe`; keep its adjacent runtime DLLs with it. It uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 FT-710 station dashboard with an embedded web interface. One application provides direct serial radio control through Hamlib, USB RF spectrum and waterfall, received-audio scope, routed audio, CAT sharing, and phone/browser access. Version **2.0.4** uses HTTPS for browser control and two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+
+### Runtime dependencies
+
+Before launching the release executable, install the matching **64-bit Hamlib 4.7.2 runtime** and make its `bin` directory available on `PATH`. The application requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. Obtain Hamlib from its [official 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2). If the Hamlib package does not provide a compatible `libwinpthread-1.dll`, install a current x64 POSIX MinGW-w64 distribution such as [WinLibs](https://winlibs.com/) and make its `mingw64/bin` directory available on `PATH`. The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are optional and are needed only for RF scope capture; download them from [FTDI's FT4222H software examples](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them beside `FT710Dashboard.exe`. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
 
 ## Features
 
@@ -330,7 +334,7 @@ The checks use the real FT-710 Hamlib driver against a loopback CAT fixture. The
 
 ## Dependencies and references
 
-Third-party source archives and binaries are intentionally kept out of Git. The build script downloads Hamlib and PortAudio into the ignored `vendor/` folder; FTDI DLLs are obtained separately and kept in ignored `runtime/ftdi/`. Packaging places the required runtime DLLs beside the application and includes upstream license notices in the local build output. Obtain upstream components from the links below. No application license has been selected yet.
+Third-party source archives and binaries are intentionally kept out of GitHub. The build script downloads Hamlib and PortAudio into the ignored `vendor/` folder; FTDI DLLs are obtained separately and kept in ignored `runtime/ftdi/`. Local builds stage required runtime DLLs and upstream license notices in `dist/`; the published GitHub executable and ZIP omit these third-party files. Obtain upstream components from the links below. No application license has been selected yet.
 
 Hamlib 4.7.2 is dynamically linked using its FT-710 backend. See the [official Hamlib 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2), [rig API](https://hamlib.sourceforge.net/manuals/4.7/group__rig.html), and [rigctld protocol reference](https://hamlib.sourceforge.net/html/rigctld.1.html). PortAudio 19.7.0 is statically linked; its upstream [API documentation](https://portaudio.com/docs/v19-doxydocs/api_overview.html) describes device and audio interfaces. `src/portaudio_wdmks.c` adapts the upstream WDM-KS driver to expose a stable device identity.
 
