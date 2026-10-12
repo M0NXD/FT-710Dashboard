@@ -10,6 +10,7 @@ This source package is provided alongside the Windows application ZIP on the sam
 | `portaudio-v19.7.0.zip` | Unmodified PortAudio 19.7.0 source |
 | `dashboard-portaudio_wdmks.c` | The WDM-KS implementation adapted by this dashboard from PortAudio |
 | `THIRD_PARTY_NOTICES.md` | Component provenance, licences, copyright references and LGPL replacement permissions |
+| `PORTAUDIO_SOURCE_NOTICES.txt` | Original per-file attribution and permission notices for the PortAudio Windows/common code |
 | `DEPENDENCIES.json` | Original download URLs, component versions and SHA-256 checksums |
 
 The original upstream source archives are preserved as downloaded. Extract them using `tar`, Windows ZIP extraction or an archive utility. The archives include the original licences and per-file copyright notices. For building Hamlib, consult its `README.build-Windows` and `scripts/build-w64.sh`; for libusb, consult its `INSTALL` and `README` files and the included MinGW build files. You may use and modify each component under its included upstream licence.

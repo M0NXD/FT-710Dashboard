@@ -394,6 +394,22 @@ Third-party source archives and binaries are kept out of the source Git history.
 
 Hamlib 4.7.2 is dynamically linked using its FT-710 backend. See the [official Hamlib 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2), [rig API](https://hamlib.sourceforge.net/manuals/4.7/group__rig.html), and [rigctld protocol reference](https://hamlib.sourceforge.net/html/rigctld.1.html). PortAudio 19.7.0 is statically linked; its upstream [API documentation](https://portaudio.com/docs/v19-doxydocs/api_overview.html) describes device and audio interfaces. `src/portaudio_wdmks.c` adapts the upstream WDM-KS driver to expose a stable device identity.
 
+### Acknowledgements and licences
+
+This dashboard uses the work of the following projects and authors. Credits below identify the principal projects and contributors; **the complete upstream author lists, copyright notices, permission terms and disclaimers are preserved in `licenses/` and the companion source archives**. Detailed component provenance and LGPL replacement permissions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+| Component | Attribution | Licence / distribution |
+| --- | --- | --- |
+| [Hamlib 4.7.2](https://github.com/Hamlib/Hamlib) | The Hamlib Group, original API authors **Frank Singleton** and **Stephane Fillod**, and the upstream backend contributors | Runtime library: **LGPL 2.1 or later**. `licenses/hamlib/` contains LICENSE, LGPL, the upstream AUTHORS list and the GPL text referenced by that AUTHORS file. |
+| [libusb 1.0.24](https://github.com/libusb/libusb) | The **libusb project and contributors**, including Johannes Erdfelt, Daniel Drake, Peter Stuge, Nathan Hjelm and Pete Batard; full list in `licenses/libusb/AUTHORS.txt` | **LGPL 2.1 or later**. Its DLL and full licence/author notices are included. |
+| [MinGW-w64 / winpthreads 13.0.0](https://github.com/mingw-w64/mingw-w64) | The **MinGW-w64 project and contributors**, with winpthreads portions credited to **Lockless Inc.** | winpthreads **MIT and BSD conditions**; additional MinGW runtime/header notices are retained under `licenses/mingw-w64/`. |
+| [GCC / libstdc++ 15.2.0](https://gcc.gnu.org/) | The **Free Software Foundation and GNU GCC contributors** | Statically linked runtime code: **GPL 3 with GCC Runtime Library Exception 3.1**. Both texts are included under `licenses/gcc/`. |
+| [WinLibs toolchain build](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-13.0.0-ucrt-r4) | **Brecht Sanders**, who provides the x64 POSIX UCRT GCC/MinGW build used for this release | The bundled threading DLL retains its upstream MinGW-w64 licences. Compiler/tools are obtained separately for development. |
+| [PortAudio 19.7.0](https://github.com/PortAudio/portaudio) | **Ross Bencina** and **Phil Burk**; Windows WDM-KS work by **Andrew Baldwin** and **Robert Bielik**; WASAPI work by **David Viens** and **Dmitry Kostjuchenko**, plus upstream contributors | **MIT-style PortAudio permission notice**. Statically linked; `licenses/portaudio/` includes the licence and per-file source attribution/permission notices. |
+| [FTDI D2XX](https://ftdichip.com/drivers/d2xx-drivers/) and [LibFT4222](https://ftdichip.com/software-examples/ft4222h-software-examples/) | **Future Technology Devices International Limited (FTDI)** | Optional RF-capture libraries, **downloaded separately under FTDI's terms**. No FTDI DLLs, drivers or SDK files are bundled. |
+
+For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the full `licenses/` folder with the application. Keep equivalent access to the corresponding LGPL sources; the release provides them in [FT710Dashboard-2.0.5-ThirdPartySources.zip](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.5/FT710Dashboard-2.0.5-ThirdPartySources.zip). The individual upstream licences govern their components; the credits table is a summary, not a replacement for those licences.
+
 - [Hamlib FT-710 backend](https://github.com/Hamlib/Hamlib/blob/4.7.2/rigs/yaesu/ft710.c)
 - [FTDI D2XX Windows desktop driver package — FTD2XX.dll](https://ftdichip.com/drivers/d2xx-drivers/)
 - [FTDI FT4222H Windows library package — LibFT4222.dll](https://ftdichip.com/software-examples/ft4222h-software-examples/)

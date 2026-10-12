@@ -48,6 +48,7 @@ foreach ($releaseLibraryName in $releaseRuntimeNames) { Copy-Item -LiteralPath (
 $releaseLicences = @(
     @{dependency='hamlib';member='hamlib-4.7.2/LICENSE';target='licenses/hamlib/LICENSE.txt'},
     @{dependency='hamlib';member='hamlib-4.7.2/COPYING.LIB';target='licenses/hamlib/COPYING.LIB.txt'},
+    @{dependency='hamlib';member='hamlib-4.7.2/COPYING';target='licenses/hamlib/COPYING.txt'},
     @{dependency='hamlib';member='hamlib-4.7.2/AUTHORS';target='licenses/hamlib/AUTHORS.txt'},
     @{dependency='libusb';member='libusb-1.0.24/COPYING';target='licenses/libusb/COPYING.txt'},
     @{dependency='libusb';member='libusb-1.0.24/AUTHORS';target='licenses/libusb/AUTHORS.txt'},
@@ -76,6 +77,42 @@ foreach ($releaseLicence in $releaseLicences) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $releaseLicenceTarget) | Out-Null
     Copy-Item -LiteralPath $releaseLicenceSource -Destination $releaseLicenceTarget
 }
+
+# Retain the per-file PortAudio credits, including its Windows driver authors.
+$releasePortAudioDirectory = $releaseExtracted['portaudio']
+$releasePortAudioMembers = @(
+    'portaudio-19.7.0/src/common',
+    'portaudio-19.7.0/src/os/win',
+    'portaudio-19.7.0/src/hostapi/skeleton',
+    'portaudio-19.7.0/src/hostapi/wasapi',
+    'portaudio-19.7.0/src/hostapi/wdmks',
+    'portaudio-19.7.0/include/portaudio.h',
+    'portaudio-19.7.0/include/pa_win_wasapi.h',
+    'portaudio-19.7.0/include/pa_win_wdmks.h',
+    'portaudio-19.7.0/include/pa_win_waveformat.h'
+)
+& tar -xf $releaseCache['portaudio'] -C $releasePortAudioDirectory @releasePortAudioMembers
+if ($LASTEXITCODE) { throw 'Cannot extract original PortAudio attribution notices.' }
+$releasePortAudioFiles = @()
+foreach ($releasePortAudioMember in $releasePortAudioMembers) {
+    $releasePortAudioPath = Join-Path $releasePortAudioDirectory $releasePortAudioMember
+    if (Test-Path -LiteralPath $releasePortAudioPath -PathType Container) { $releasePortAudioFiles += Get-ChildItem -LiteralPath $releasePortAudioPath -Recurse -File | Where-Object { $_.Extension -in @('.c','.h') } }
+    else { $releasePortAudioFiles += Get-Item -LiteralPath $releasePortAudioPath }
+}
+$releasePortAudioCatalogue = [Text.StringBuilder]::new()
+[void]$releasePortAudioCatalogue.AppendLine('PortAudio 19.7.0 - original source attribution and permission notices')
+[void]$releasePortAudioCatalogue.AppendLine('Extracted without changing the notice text from the SHA-256-pinned upstream archive.')
+$releasePortAudioRoot = Join-Path $releasePortAudioDirectory 'portaudio-19.7.0'
+foreach ($releasePortAudioFile in ($releasePortAudioFiles | Sort-Object FullName -Unique)) {
+    $releasePortAudioComments = @([regex]::Matches([IO.File]::ReadAllText($releasePortAudioFile.FullName),'(?s)/\*.*?\*/') | Where-Object { $_.Value -match '(?i)copyright|permission is hereby|the text above constitutes|author:|contribut|written by' })
+    if (!$releasePortAudioComments.Count) { continue }
+    [void]$releasePortAudioCatalogue.AppendLine()
+    [void]$releasePortAudioCatalogue.AppendLine('File: ' + $releasePortAudioFile.FullName.Substring($releasePortAudioRoot.Length + 1).Replace('\','/'))
+    foreach ($releasePortAudioComment in $releasePortAudioComments) { [void]$releasePortAudioCatalogue.AppendLine($releasePortAudioComment.Value) }
+}
+$releasePortAudioNoticePath = Join-Path $releaseStage 'licenses/portaudio/SOURCE_NOTICES.txt'
+[IO.File]::WriteAllText($releasePortAudioNoticePath,$releasePortAudioCatalogue.ToString(),[Text.UTF8Encoding]::new($false))
+Copy-Item -LiteralPath $releasePortAudioNoticePath -Destination (Join-Path $releaseSourceStage 'PORTAUDIO_SOURCE_NOTICES.txt')
 
 $releaseSourceArchives = @($releaseDependencies.downloads | Where-Object { $_.sourceArchive })
 $releaseManifest = [ordered]@{
@@ -114,7 +151,7 @@ function Write-ReleaseZip([string]$Stage, [string]$Name, [string[]]$Allowed) {
     Set-Content -LiteralPath ($releaseZipPath + '.sha256') -Value ($releaseZipHash + '  ' + [IO.Path]::GetFileName($releaseZipPath)) -Encoding ascii
     Write-Output ($Name + ' SHA256: ' + $releaseZipHash)
 }
-$releaseAllowed = @('FT710Dashboard.exe','README.md','check-runtime.ps1','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json') + $releaseRuntimeNames + @($releaseLicences | ForEach-Object { $_.target })
-$releaseSourceAllowed = @('README.md','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','dashboard-portaudio_wdmks.c') + @($releaseSourceArchives | ForEach-Object { $_.file })
+$releaseAllowed = @('FT710Dashboard.exe','README.md','check-runtime.ps1','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','licenses/portaudio/SOURCE_NOTICES.txt') + $releaseRuntimeNames + @($releaseLicences | ForEach-Object { $_.target })
+$releaseSourceAllowed = @('README.md','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','dashboard-portaudio_wdmks.c','PORTAUDIO_SOURCE_NOTICES.txt') + @($releaseSourceArchives | ForEach-Object { $_.file })
 Write-ReleaseZip $releaseStage ('FT710Dashboard-' + $releaseVersion + '-Windows-x64.zip') $releaseAllowed
 Write-ReleaseZip $releaseSourceStage ('FT710Dashboard-' + $releaseVersion + '-ThirdPartySources.zip') $releaseSourceAllowed
