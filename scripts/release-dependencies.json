@@ -1,0 +1,89 @@
+{
+  "toolchain": {
+    "name": "WinLibs GCC 15.2.0 / MinGW-w64 13.0.0, x64 POSIX UCRT, release 4",
+    "url": "https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip",
+    "sha256": "cd140e153bf303703f9dce27a4b7d0a8dcb2a41c39b7fffa477a12a8bd049bca"
+  },
+  "runtimeLibraries": [
+    {
+      "file": "libhamlib-4.dll",
+      "component": "Hamlib",
+      "version": "4.7.2",
+      "license": "LGPL-2.1-or-later",
+      "sha256": "72f09e0bc1118c11ae0652612d58bd04ba620c4dcf2d4181d8dc39d4af60d28e",
+      "binaryUrl": "https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.zip",
+      "binaryArchiveSha256": "8553bc6c5c6032e8debf99c017e98f58fed7e07e7c25d04815dc3e8bbe3304c7",
+      "sourceId": "hamlib"
+    },
+    {
+      "file": "libusb-1.0.dll",
+      "component": "libusb",
+      "version": "1.0.24.11584",
+      "license": "LGPL-2.1-or-later",
+      "sha256": "86d5d599c427d5c168bea98f24584520be6187df142dd0ff1def4a834848a0a2",
+      "binaryUrl": "https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.zip",
+      "binaryArchiveSha256": "8553bc6c5c6032e8debf99c017e98f58fed7e07e7c25d04815dc3e8bbe3304c7",
+      "sourceId": "libusb"
+    },
+    {
+      "file": "libwinpthread-1.dll",
+      "component": "MinGW-w64 winpthreads",
+      "version": "13.0.0 / WinLibs GCC 15.2.0 UCRT release 4",
+      "license": "MIT and BSD-3-Clause notices in winpthreads/COPYING",
+      "sha256": "8e59f792bdc733c50dfa9aa6ebb5d9d3f31b92a2c3be27815da24223c8bb4539",
+      "binaryUrl": "https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip",
+      "binaryArchiveSha256": "cd140e153bf303703f9dce27a4b7d0a8dcb2a41c39b7fffa477a12a8bd049bca",
+      "sourceId": "mingw-w64"
+    }
+  ],
+  "downloads": [
+    {
+      "id": "hamlib",
+      "file": "hamlib-4.7.2.tar.gz",
+      "cache": "vendor/hamlib-4.7.2.tar.gz",
+      "url": "https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-4.7.2.tar.gz",
+      "sha256": "ae1fcf2dbc80ea0786ea8f047b09399c3f7737d1930442f61a031708ed33e88f",
+      "sourceArchive": true
+    },
+    {
+      "id": "libusb",
+      "file": "libusb-1.0.24.tar.bz2",
+      "cache": "vendor/release-dependencies/libusb-1.0.24.tar.bz2",
+      "url": "https://github.com/libusb/libusb/releases/download/v1.0.24/libusb-1.0.24.tar.bz2",
+      "sha256": "7efd2685f7b327326dcfb85cee426d9b871fd70e22caa15bb68d595ce2a2b12a",
+      "sourceArchive": true
+    },
+    {
+      "id": "mingw-w64",
+      "file": "mingw-w64-v13.0.0.tar.gz",
+      "cache": "vendor/release-dependencies/mingw-w64-v13.0.0.tar.gz",
+      "url": "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/refs/tags/v13.0.0",
+      "sha256": "1a910473313a329316025fa4563160deae378884e4b8ee573d1d03ac006b2e61",
+      "sourceArchive": true
+    },
+    {
+      "id": "portaudio",
+      "file": "portaudio-v19.7.0.zip",
+      "cache": "vendor/portaudio-v19.7.0.zip",
+      "url": "https://codeload.github.com/PortAudio/portaudio/zip/refs/tags/v19.7.0",
+      "sha256": "ce1e7b27ad362cb9745de7da3d266a996b085ca75a12ac62c881f88ab6894acf",
+      "sourceArchive": true
+    },
+    {
+      "id": "gcc-license",
+      "file": "GCC-COPYING3.txt",
+      "cache": "vendor/release-dependencies/GCC-COPYING3.txt",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-15.2.0/COPYING3",
+      "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "sourceArchive": false
+    },
+    {
+      "id": "gcc-exception",
+      "file": "GCC-COPYING.RUNTIME.txt",
+      "cache": "vendor/release-dependencies/GCC-COPYING.RUNTIME.txt",
+      "url": "https://raw.githubusercontent.com/gcc-mirror/gcc/releases/gcc-15.2.0/COPYING.RUNTIME",
+      "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74",
+      "sourceArchive": false
+    }
+  ]
+}

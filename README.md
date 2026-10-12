@@ -1,6 +1,6 @@
 # FT-710 Dashboard — Remote Control for Yaesu FT-710
 
-A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.5** also provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.5** also provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The Windows release ZIP bundles the required **Hamlib, libusb and threading runtime DLLs**, with their licences and notices. **FTDI DLLs for RF capture are downloaded separately.** The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
 
 ## Remote control at a glance
 
@@ -8,21 +8,28 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 ### Runtime dependencies
 
-The release ZIP contains `FT710Dashboard.exe`, this README, and `check-runtime.ps1`. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** It requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. The direct downloads below match the Hamlib and WinLibs compiler versions used for **dashboard 2.0.5**.
+**Download the Windows x64 release ZIP and extract the whole folder. No separate Hamlib or compiler installation is needed to run that package.** It includes `FT710Dashboard.exe`, `libhamlib-4.dll`, `libusb-1.0.dll`, the matching `libwinpthread-1.dll`, this README, `check-runtime.ps1`, `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the `licenses/` directory. Keep the DLLs beside the executable and retain the notices/licences when copying or redistributing the package.
+
+The [same GitHub release](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.5) provides **FT710Dashboard-2.0.5-ThirdPartySources.zip**, containing the corresponding Hamlib 4.7.2 and libusb 1.0.24 sources, plus MinGW-w64 13.0.0 and PortAudio 19.7.0 sources. See [third-party notices](THIRD_PARTY_NOTICES.md) for provenance, LGPL replacement permissions and licence details. The application uses external, replaceable Hamlib and libusb DLLs.
 
 #### Direct downloads and quick setup
+
+1. [Download the dashboard Windows x64 ZIP](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.5/FT710Dashboard-2.0.5-Windows-x64.zip).
+2. Extract **all files and folders**, then open `FT710Dashboard.exe`. Moving only the executable elsewhere will leave its required DLLs behind.
+3. Install Yaesu's USB COM driver and configure the radio connection as described below. For RF capture, separately install the FTDI driver, obtain the two FTDI DLLs and enable **SCU-LAN10 = ON**; see [FTDI DLLs for RF capture](#ftdi-dlls-for-rf-capture).
+
+If Windows reports a missing entry point or DLL, run `powershell -ExecutionPolicy Bypass -File .\check-runtime.ps1` from the extracted dashboard folder. The helper checks the packaged runtime versions without opening a radio connection.
+
+**Manual downloads are only needed for the standalone EXE, a source build, or replacement runtime files.** These links match the versions used by dashboard 2.0.5:
 
 | Required component | Direct download | Files to use from the extracted package |
 | --- | --- | --- |
 | Hamlib **4.7.2, Windows x64** | [Download Hamlib x64 ZIP](https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.zip) | `hamlib-w64-4.7.2\bin\libhamlib-4.dll` and `hamlib-w64-4.7.2\bin\libusb-1.0.dll` |
 | MinGW runtime — WinLibs **GCC 15.2.0, x64, POSIX, UCRT, release 4** | [Download matching WinLibs/MinGW x64 ZIP](https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip) | `mingw64\bin\libwinpthread-1.dll` |
 
-1. Extract the dashboard release ZIP into its own folder.
-2. Download and extract the two upstream ZIPs above. Copy the **two Hamlib DLLs** and **the WinLibs `libwinpthread-1.dll`** into the dashboard folder, beside `FT710Dashboard.exe`. You do not need to install a compiler to run the dashboard.
-3. Use the threading DLL from the linked WinLibs package. An older `libwinpthread-1.dll` supplied by another application or Hamlib package may lack `clock_gettime64` and prevent the dashboard from starting.
-4. Run `powershell -ExecutionPolicy Bypass -File .\check-runtime.ps1` from the dashboard folder, then open `FT710Dashboard.exe`.
+For a manual installation, extract both upstream ZIPs and copy the **two Hamlib DLLs** and **the WinLibs `libwinpthread-1.dll`** beside the dashboard executable. Use the threading DLL from the linked WinLibs package: an older one supplied by another application or Hamlib package may lack `clock_gettime64` and prevent the dashboard from starting. You do not need to install a compiler to run the dashboard.
 
-The minimum application folder contains:
+The packaged application folder contains:
 
 ```text
 FT710Dashboard.exe
@@ -31,11 +38,14 @@ libusb-1.0.dll
 libwinpthread-1.dll
 README.md
 check-runtime.ps1
+THIRD_PARTY_NOTICES.md
+DEPENDENCIES.json
+licenses/
 ```
 
 Alternative Hamlib installation: [download the Hamlib x64 installer](https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.exe) and make its installed `bin` directory available on `PATH`; still use the compatible WinLibs threading DLL beside the dashboard. The [Hamlib release page](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2) and [WinLibs release page](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-13.0.0-ucrt-r4) provide package details and upstream checksums.
 
-The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Obtain them from the two separate FTDI packages below and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
+The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Obtain them from the two separate FTDI packages below and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement; its notice is included under `licenses/portaudio/`. For local development builds, CMake stages dependencies into the ignored `dist/` directory. Release packaging selects only the three approved runtime DLLs and excludes the FTDI files.
 
 #### FTDI DLLs for RF capture
 
@@ -380,7 +390,7 @@ The checks use the real FT-710 Hamlib driver against a loopback CAT fixture. The
 
 ## Dependencies and references
 
-Third-party source archives and binaries are intentionally kept out of GitHub. The build script downloads Hamlib and PortAudio into the ignored `vendor/` folder; FTDI DLLs are obtained separately and kept in ignored `runtime/ftdi/`. Local builds stage required runtime DLLs and upstream license notices in `dist/`; the published GitHub executable and ZIP omit these third-party files. Obtain upstream components from the links below. No application license has been selected yet.
+Third-party source archives and binaries are kept out of the source Git history. The build script downloads Hamlib and PortAudio into the ignored `vendor/` folder; FTDI DLLs are obtained separately and kept in ignored `runtime/ftdi/`. The published Windows ZIP includes only the approved Hamlib, libusb and winpthreads runtime DLLs, with upstream notices under `licenses/` and a checksum/provenance inventory in `DEPENDENCIES.json`. The corresponding third-party source archives are offered separately on the same release page. FTDI DLLs, drivers and SDK files are excluded from both release ZIPs. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). No general application license has been selected; the notices explicitly grant the permissions required for modifying the application for your own use and debugging replacements of its LGPL libraries.
 
 Hamlib 4.7.2 is dynamically linked using its FT-710 backend. See the [official Hamlib 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2), [rig API](https://hamlib.sourceforge.net/manuals/4.7/group__rig.html), and [rigctld protocol reference](https://hamlib.sourceforge.net/html/rigctld.1.html). PortAudio 19.7.0 is statically linked; its upstream [API documentation](https://portaudio.com/docs/v19-doxydocs/api_overview.html) describes device and audio interfaces. `src/portaudio_wdmks.c` adapts the upstream WDM-KS driver to expose a stable device identity.
 
@@ -414,13 +424,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\check-runtime.ps1
 
 It checks x64 runtime discovery, Hamlib 4.7.2 loading/version and the compiler threading runtime's `clock_gettime64` export. It lists optional FTDI runtime files separately and links to upstream downloads. It does not install dependencies. For a local staged build use `scripts/check-runtime.ps1 -ApplicationDirectory dist`. The default Windows loader must be able to find the DLLs before the executable can start.
 
-Create the application-only release after building:
+Create the Windows runtime package and the companion third-party source package after building:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-The script uses an explicit allowlist, verifies the ZIP contents, and writes a SHA-256 checksum under ignored `artifacts/releases/`. It includes only the executable, README and runtime-check helper; Hamlib, FTDI and other third-party runtime DLLs are excluded. Local `dist/` staging retains separately obtained dependencies for running the app.
+The script uses explicit allowlists for both ZIPs, verifies the runtime DLLs and upstream source/licence downloads against `scripts/release-dependencies.json`, and writes SHA-256 checksums under ignored `artifacts/releases/`. The Windows ZIP includes the executable, the **three approved runtime DLLs**, README, runtime-check helper, dependency inventory and all licence notices. The companion ZIP preserves the complete original Hamlib/libusb/MinGW-w64/PortAudio source archives, including upstream build files and the dashboard's adapted PortAudio WDM-KS file. Publish **both ZIPs and both checksum files together** so users have equivalent access to the LGPL sources. FTDI DLLs, drivers and SDK files are excluded from both archives.
+
+Use the pinned WinLibs toolchain in the dependency lock for release builds. Packaging rejects different runtime DLLs so a source/version mismatch is caught before publication. If changing dependencies, update the lock, corresponding sources and notices together. The Windows workflow uses the same pinned toolchain. A package run requires an empty staging/output location; use `-OutputDirectory` to select a new folder for a replacement package. Local `dist/` staging can still retain separately obtained FTDI files for your own RF capture.
 
 Offline regression checks are registered with CTest:
 
@@ -430,4 +442,4 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Node.js is needed only for the browser regression tests, not for deployment. The checks include PTT release fault injection, all six native pages, delayed preference acknowledgements, continuous tuning, RF-grid transitions, browser mic ownership and native-server/browser state-delta round trips. The Windows GitHub Actions workflow builds without FTDI DLLs, runs the offline checks, and uploads only the validated application release archive. Hardware/phone acceptance checks still need the actual FT-710 and browser.
+Node.js is needed only for the browser regression tests, not for deployment. The checks include PTT release fault injection, all six native pages, delayed preference acknowledgements, continuous tuning, RF-grid transitions, browser mic ownership and native-server/browser state-delta round trips. The Windows GitHub Actions workflow builds without FTDI DLLs, runs the offline checks, and uploads both validated release archives and their checksums. Hardware/phone acceptance checks still need the actual FT-710 and browser.

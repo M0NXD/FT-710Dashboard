@@ -8,16 +8,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
-        id: msys2
-        with:
-          msystem: UCRT64
-          update: true
-          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja
+      - name: Install pinned WinLibs x64 toolchain
+        shell: pwsh
+        run: |
+          $taskToolchain = (Get-Content -Raw scripts/release-dependencies.json | ConvertFrom-Json).toolchain
+          $taskToolchainZip = Join-Path $env:RUNNER_TEMP 'ft710-winlibs.zip'
+          $taskToolchainDirectory = Join-Path $env:RUNNER_TEMP 'ft710-winlibs'
+          Invoke-WebRequest -Uri $taskToolchain.url -OutFile $taskToolchainZip
+          if ((Get-FileHash -LiteralPath $taskToolchainZip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $taskToolchain.sha256) { throw 'Toolchain checksum mismatch' }
+          Expand-Archive -LiteralPath $taskToolchainZip -DestinationPath $taskToolchainDirectory
+          (Join-Path $taskToolchainDirectory 'mingw64/bin') | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Build without optional FTDI binaries
         shell: pwsh
         run: |
-          $env:PATH = '${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin;' + $env:PATH
           ./scripts/build.ps1
           cmake -S . -B build -DBUILD_GUI_CHECKS=ON -DBUILD_RADIO_CHECKS=ON
           if ($LASTEXITCODE) { throw 'Configure failed' }
