@@ -127,6 +127,7 @@ bool Capture::start() {
     if (running_.load(std::memory_order_relaxed)) return true;
     if (thread_.joinable()) thread_.join();
     stopRequested_.store(false, std::memory_order_relaxed);
+    { std::lock_guard lock(mutex_); latest_ = {}; ++generation_; }
     running_.store(true, std::memory_order_relaxed);
     setStatus(L"Opening FT4222 A for RF scope capture…");
     try {
@@ -144,6 +145,7 @@ void Capture::stop() {
     if (thread_.joinable()) thread_.join();
     running_.store(false, std::memory_order_relaxed);
     setStatus(L"RF scope capture stopped");
+    { std::lock_guard lock(mutex_); latest_.valid = false; }
 }
 
 bool Capture::latest(Frame& frame) const {
@@ -206,6 +208,7 @@ void Capture::run() {
         {
             std::lock_guard lock(mutex_);
             decoded.sequence = ++sequence_;
+            decoded.generation = generation_; decoded.acquiredAt = GetTickCount64();
             latest_ = decoded;
             status_ = L"Live FT-710 RF scope · " + spanLabel(decoded.spanIndex) + L" · 850 bins";
         }

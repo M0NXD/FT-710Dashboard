@@ -52,6 +52,7 @@ struct Snapshot {
     bool standby = false;
     bool canPower = false, canPtt = false;
     bool dashboardPtt = false;
+    bool releasePending = false;
     std::string connectionStatus = "Disconnected", model = "Yaesu FT-710", endpoint, error;
     Vfo a, b;
     vfo_t activeVfo = RIG_VFO_A, settingsVfo = RIG_VFO_CURR;
@@ -102,6 +103,8 @@ private:
     bool heldPtt_ = false;
     std::uint64_t catPttOwner_ = 0;
     std::chrono::steady_clock::time_point pttDeadline_{};
+    std::chrono::steady_clock::time_point releaseDeadline_{};
+    int releaseTransmit(const std::string& reason);
     void run();
     void execute(const Command& command);
     void connect(const Connection& connection);

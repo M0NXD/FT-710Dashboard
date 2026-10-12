@@ -20,6 +20,9 @@ struct Frame {
     std::uint32_t spanIndex = 0;
     bool frequencyValid = false;
     bool valid = false;
+    ULONGLONG acquiredAt = 0;
+    std::uint64_t generation = 0;
+    bool fresh() const { return valid && acquiredAt && GetTickCount64() - acquiredAt < 1000; }
 };
 
 class Capture {
@@ -31,6 +34,7 @@ public:
 
     bool start();
     void stop();
+    void requestStop() { stopRequested_ = true; }
     bool latest(Frame& frame) const;
     std::wstring status() const;
     bool running() const { return running_.load(std::memory_order_relaxed); }
@@ -42,6 +46,7 @@ private:
     Frame latest_{};
     std::wstring status_ = L"RF scope stopped";
     std::uint64_t sequence_ = 0;
+    std::uint64_t generation_ = 0;
     void run();
     void setStatus(std::wstring status);
 };

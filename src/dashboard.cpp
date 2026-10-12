@@ -1,5 +1,6 @@
 #include "dashboard.hpp"
 #include "dashboard_ids.hpp"
+#include "station_settings.hpp"
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <commdlg.h>
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <cctype>
 #include <cwctype>
+#include <cstring>
 #include <string_view>
 #include <tuple>
 
@@ -299,6 +301,7 @@ Dashboard::Dashboard(HINSTANCE instance, bool demo, std::wstring capturePath, in
     }
 }
 Dashboard::~Dashboard() {
+    audioJobs_.stop(); scopeJobs_.stop();
     stopAudio();
     rfCapture_.stop();
     if (webServer_) webServer_->stop();
@@ -463,6 +466,7 @@ void Dashboard::createControls() {
     control(AudioReceiveGain, L"EDIT", L"100", ES_NUMBER | ES_AUTOHSCROLL, 3);
     control(AudioMicrophoneGain, L"EDIT", L"100", ES_NUMBER | ES_AUTOHSCROLL, 3);
     combo(dropdown(AudioPttLimit, 3), {L"30 seconds", L"60 seconds", L"180 seconds", L"300 seconds", L"600 seconds"}, 2);
+    button(AudioUnattended,L"Unattended browser audio: Off",3);
     combo(dropdown(ScopeSpan, 4), {L"0 - 3 kHz", L"0 - 6 kHz", L"0 - 12 kHz", L"0 - 24 kHz"}, 1);
     combo(dropdown(ScopeGain, 4), {L"-20 dB", L"0 dB", L"+10 dB", L"+20 dB", L"+30 dB", L"+40 dB", L"+60 dB"}, 1);
     combo(dropdown(ScopeFloor, 4), {L"-60 dB", L"-80 dB", L"-100 dB", L"-120 dB"}, 2);
@@ -553,6 +557,7 @@ void Dashboard::layout() {
     move(AudioDevice + 2, 48, 510, audioHalf, 250); move(AudioDevice + 3, 64 + audioHalf, 510, audioHalf, 250);
     move(AudioMicrophone, 48, 565, 192, 32); move(AudioMicrophoneGain, width - 140, 565, 90, 30);
     move(AudioPttLimit, width - 228, 651, 180, 240);
+    move(AudioUnattended,width - 492,228,286,31);
     move(ScopeReceive, width - 224, 228, 192, 32);
     move(ScopeSpan, 48, 339, 134, 230); move(ScopeGain, 200, 339, 120, 230); move(ScopeFloor, 338, 339, 104, 230);
     move(ScopeFreeze, 462, 339, 100, 32); move(ScopePeak, 574, 339, 124, 32); move(ScopeClear, 710, 339, 80, 32);
@@ -732,7 +737,7 @@ void Dashboard::paint(HDC dc) {
         label(32, h - 229, w - 64, 24, L"FT-710 CAT console  /  select a query or enter one command ending in ;", bodyFont_);
         label(32, h - 159, w - 64, 22, L"Direct USB CAT only. EX menu commands require the menu ID and values from the Yaesu reference manual.", smallFont_, Muted);
     } else if (page_ == 3) {
-        label(32, 228, w - 244, 32, L"AUDIO ROUTING  /  RADIO & REMOTE DEVICES", bodyFont_);
+        label(32, 228, w - 564, 32, L"AUDIO ROUTING  /  RADIO & REMOTE DEVICES", bodyFont_);
         label(32, 264, w - 64, 23, audioError_.empty() ? (audio::remoteSession() ? L"RDP session: radio = Host hardware / direct; phone = RDP / phone. Refresh after connecting devices." : L"Host hardware / direct stays independent of RDP. Windows shared devices are also available.") : audioError_, smallFont_, audioError_.empty() ? Muted : Amber);
         int half = (w - 112) / 2;
         card(dc, r(28, 296, w - 56, 144));
@@ -791,10 +796,10 @@ void Dashboard::paint(HDC dc) {
     } else if (page_ == 5) {
         label(32, 228, w - 64, 32, L"FT-710 RF SCOPE  /  FT4222 USB SPI", bodyFont_);
         const auto active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
-        const auto center = active.frequencyValid ? static_cast<std::uint64_t>(std::llround(active.frequency)) : 0;
+        const auto center = rfFrame_.frequencyValid ? rfFrame_.centerHz : active.frequencyValid ? static_cast<std::uint64_t>(std::llround(active.frequency)) : 0;
         const auto span = rf_scope::spanHz(rfFrame_.valid ? rfFrame_.spanIndex : static_cast<unsigned>(std::max(0, selected(controls_[RfSpan]))));
-        label(32, 265, w - 64, 22, rfUiStatus_, smallFont_, rfFrame_.valid ? Accent : Muted);
-        label(32, 287, w - 64, 20, L"RF scope frames are not audio or IQ. Apply a span through CAT-2, then start capture. Tap the spectrum to tune.", smallFont_, Muted);
+        label(32, 265, w - 64, 22, rfUiStatus_, smallFont_, rfFrame_.fresh() && rfCapture_.running() ? Accent : Muted);
+        label(32, 287, w - 64, 20, rfApplyStatus_.empty() ? L"Apply a span through CAT-2, then start capture. Tap a live spectrum or waterfall to tune." : rfApplyStatus_, smallFont_, Muted);
         card(dc, r(28, 310, w - 56, 68));
         label(48, 315, 114, 20, L"RF SPAN", smallFont_, Muted);
         label(178, 315, 176, 20, L"STANDARD / CAT-2 COM", smallFont_, Muted);
@@ -839,21 +844,25 @@ void Dashboard::paint(HDC dc) {
         fill(dc, waterfall, Background);
         const int rows = static_cast<int>(std::min<std::size_t>(rfHistory_.size(), static_cast<std::size_t>(std::max<LONG>(0, waterfall.bottom - waterfall.top))));
         if (rows > 0) {
-            std::vector<std::uint32_t> pixels(static_cast<std::size_t>(rows) * rf_scope::BinCount);
+            const bool changed = rfPixels_.size() != static_cast<std::size_t>(rows) * rf_scope::BinCount || rfPixelSequence_ != rfRenderedSequence_;
+            const bool incremental = changed && rfPixelSequence_ + 1 == rfRenderedSequence_ && rfPixels_.size() == static_cast<std::size_t>(rows) * rf_scope::BinCount;
+            if (incremental && rows > 1) std::memmove(rfPixels_.data() + rf_scope::BinCount,rfPixels_.data(),static_cast<std::size_t>(rows-1)*rf_scope::BinCount*sizeof(std::uint32_t));
+            rfPixels_.resize(static_cast<std::size_t>(rows) * rf_scope::BinCount);
             constexpr std::array<COLORREF, 8> palette{RGB(5,8,30), RGB(27,25,108), RGB(22,79,184), RGB(0,170,216), RGB(37,220,151), RGB(236,231,74), RGB(255,121,35), RGB(255,246,220)};
-            for (int row = 0; row < rows; ++row) for (std::size_t x = 0; x < rf_scope::BinCount; ++x) {
+            if (changed) for (int row = 0; row < (incremental ? 1 : rows); ++row) for (std::size_t x = 0; x < rf_scope::BinCount; ++x) {
                 double level = rfHistory_[row][x] / 255.0 * (palette.size() - 1); int segment = std::min(static_cast<int>(palette.size()) - 2, static_cast<int>(level)); double part = level - segment;
                 auto a = palette[segment], b = palette[segment + 1];
                 auto channel = [&](int shift) { return static_cast<int>(((a >> shift) & 255) + part * (static_cast<int>((b >> shift) & 255) - static_cast<int>((a >> shift) & 255))); };
-                pixels[static_cast<std::size_t>(row) * rf_scope::BinCount + x] = RGB(channel(0), channel(8), channel(16));
+                rfPixels_[static_cast<std::size_t>(row) * rf_scope::BinCount + x] = (channel(0) << 16) | (channel(8) << 8) | channel(16);
             }
+            rfPixelSequence_ = rfRenderedSequence_;
             BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = static_cast<LONG>(rf_scope::BinCount);
             info.bmiHeader.biHeight = -rows; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
             // One captured RF frame occupies one display row. New frames are
             // inserted at the top, moving older frames down until they leave
             // the visible area at the bottom.
             StretchDIBits(dc, waterfall.left, waterfall.top, waterfall.right-waterfall.left, rows,
-                0, 0, static_cast<int>(rf_scope::BinCount), rows, pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+                0, 0, static_cast<int>(rf_scope::BinCount), rows, rfPixels_.data(), &info, DIB_RGB_COLORS, SRCCOPY);
         } else drawText(dc, smallFont_, Muted, waterfall, L"Waiting for FT4222 RF scope frames", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         for (int i = 0; i <= 4; ++i) label(94 + (w - 140) * i / 4 - 48, waterfall.bottom + 1, 96, 18, tick(i), smallFont_, Muted, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1004,7 +1013,7 @@ void Dashboard::update(const radio::Snapshot& state) {
     bool becameOnline = !state_.online && state.online;
     bool settingsVfoChanged = state_.settingsVfo != state.settingsVfo;
     bool pttChanged = state_.pttKnown != state.pttKnown || state_.transmitting != state.transmitting ||
-        state_.dashboardPtt != state.dashboardPtt;
+        state_.dashboardPtt != state.dashboardPtt || state_.releasePending != state.releasePending;
     state_ = state;
     if (generationChanged) { pendingFrequency_ = {}; pendingMode_ = {}; pendingQuick_ = {}; pendingVfo_ = 0; }
     if (state.vfoRevision >= pendingVfo_) pendingVfo_ = 0;
@@ -1029,7 +1038,7 @@ void Dashboard::update(const radio::Snapshot& state) {
     EnableWindow(controls_[SharePort], !catServer_ || !catServer_->running());
     textIfChanged(controls_[Connect], state.portOpen ? L"Disconnect" : state.busy ? L"Opening..." : L"Connect");
     EnableWindow(controls_[Connect], !state.busy);
-    EnableWindow(controls_[PowerOn], state.portOpen && state.canPower && !state.busy);
+    EnableWindow(controls_[PowerOn], state.portOpen && state.canPower && !state.busy && !state.transmitting && !state.releasePending);
     EnableWindow(controls_[PowerOff], state.portOpen && state.canPower && !state.busy && !state.poweredOff && !state.standby);
     for (int id : {ConnectionKind, Endpoint, Baud, StopBits, Flow, Poll}) EnableWindow(controls_[id], !state.portOpen && !state.busy);
     bool serial = selected(controls_[ConnectionKind]) == 0;
@@ -1038,8 +1047,8 @@ void Dashboard::update(const radio::Snapshot& state) {
     bool live = state.online && !state.busy;
     for (int id : {TuneVfo, Frequency, Tune, Mode, Width, SetMode, Step, VfoA, VfoB, Swap, Copy}) EnableWindow(controls_[id], live);
     for (int id : {Ptt, PttLatch}) {
-        EnableWindow(controls_[id], state.dashboardPtt || pttPending_ || (live && state.canPtt && state.pttKnown && !state.transmitting));
-        textIfChanged(controls_[id], state.dashboardPtt || pttLatched_ ? L"PTT off" : pttPending_ ? L"Starting TX..." : L"PTT on");
+        EnableWindow(controls_[id], state.releasePending || state.dashboardPtt || pttPending_ || (live && state.canPtt && state.pttKnown && !state.transmitting));
+        textIfChanged(controls_[id], state.releasePending ? L"Retry release" : state.dashboardPtt || pttLatched_ ? L"PTT off" : pttPending_ ? L"Starting TX..." : L"PTT on");
     }
     EnableWindow(controls_[Refresh], state.portOpen && !state.busy);
     EnableWindow(controls_[Export], !state.settings.empty());
@@ -1176,12 +1185,8 @@ void Dashboard::connect() {
     if (state_.portOpen) { releasePtt(); stopAudio(); if (catServer_) catServer_->stop(); cmd.action = radio::Action::Disconnect; send(cmd); return; }
     sharingError_.clear();
     cmd.action = radio::Action::Connect;
-    cmd.connection.type = static_cast<radio::ConnectionType>(selected(controls_[ConnectionKind]));
-    cmd.connection.endpoint = narrow(textOf(controls_[Endpoint]));
-    cmd.connection.baud = std::stoi(narrow(textOf(controls_[Baud])));
-    cmd.connection.stopBits = selected(controls_[StopBits]) == 1 ? 2 : 1;
-    cmd.connection.handshake = narrow(textOf(controls_[Flow]));
-    cmd.connection.pollMs = std::stoi(narrow(textOf(controls_[Poll])));
+    cmd.connection = station_settings::connection({{"kind",std::to_string(selected(controls_[ConnectionKind]))},{"endpoint",narrow(textOf(controls_[Endpoint]))},
+        {"baud",narrow(textOf(controls_[Baud]))},{"stopBits",narrow(textOf(controls_[StopBits]))},{"flow",narrow(textOf(controls_[Flow]))},{"poll",narrow(textOf(controls_[Poll]))}});
     savePreferences();
     state_.busy = true;
     EnableWindow(controls_[Connect], FALSE);
@@ -1221,8 +1226,8 @@ void Dashboard::command(int id, int notification) {
         if (id >= QuickEdit && id < QuickEdit + 6 && notification == EN_CHANGE) { quickDirty_[id - QuickEdit] = true; return; }
         if (id >= AudioDevice && id < AudioDevice + 4 && notification == CBN_SELCHANGE) {
             int slot = id - AudioDevice, choice = selected(controls_[id]);
-            if (slot < 2) { receiveWanted_ = false; receiveAudio_.stop(); receiveAudio_.spectrum().discard(); scope_.clear(); }
-            else { microphoneWanted_ = false; microphoneAudio_.stop(); releasePtt(); }
+            if (slot < 2) { receiveWanted_ = false; stopRoute(receiveAudio_); receiveAudio_.spectrum().discard(); scope_.clear(); }
+            else { microphoneWanted_ = false; stopRoute(microphoneAudio_); releasePtt(); }
             audioSelectedIds_[slot] = choice > 0 && static_cast<std::size_t>(choice) < audioDeviceIds_[slot].size() ? audioDeviceIds_[slot][choice] : L"";
             auto device = std::find_if(audioDevices_.begin(), audioDevices_.end(), [&](const auto& d) { return d.id == audioSelectedIds_[slot] && d.input == (slot == 0 || slot == 2); });
             if (device != audioDevices_.end()) audioSelectedNames_[slot] = device->name;
@@ -1341,7 +1346,7 @@ void Dashboard::command(int id, int notification) {
         case TabScope: page_ = 4; layout(); updateAudio(); return;
         case TabRfScope: page_ = 5; layout(); updateRfScope(); return;
         case RfCapture:
-            setRfCapture(!rfCapture_.running()); return;
+            setRfCapture(!rfCaptureWanted_); return;
         case RfApplySpan: {
             static constexpr int baudRates[]{4800, 9600, 19200, 38400, 115200};
             auto baud = baudRates[std::clamp(selected(controls_[RfCat2Baud]), 0, 4)];
@@ -1351,12 +1356,10 @@ void Dashboard::command(int id, int notification) {
             try { level = std::stod(levelText, &consumed); }
             catch (...) { rfUiStatus_ = L"Enter a valid waterfall level from -30 to +30 dB in 0.5 dB steps"; log(rfUiStatus_); invalidateArea(28, 228 + 48, canvasWidth_ - 56, canvasHeight_ - 228); return; }
             if (consumed != levelText.size()) { rfUiStatus_ = L"Enter a valid waterfall level from -30 to +30 dB in 0.5 dB steps"; log(rfUiStatus_); invalidateArea(28, 228 + 48, canvasWidth_ - 56, canvasHeight_ - 228); return; }
-            auto result = rf_scope::applySpan(port, static_cast<unsigned>(std::max(0, selected(controls_[RfSpan]))), static_cast<unsigned>(baud), level);
-            std::wostringstream levelLabel; levelLabel << std::fixed << std::setprecision(1) << level;
-            rfUiStatus_ = result.empty() ? L"Radio confirmed " + rf_scope::spanLabel(static_cast<unsigned>(selected(controls_[RfSpan]))) + L" span and " + levelLabel.str() + L" dB waterfall level via CAT-2" : result;
-            savePreferences(); log(rfUiStatus_); invalidateArea(28, 228 + 48, canvasWidth_ - 56, canvasHeight_ - 228); return;
+            applyRfSettings(port, static_cast<unsigned>(std::max(0, selected(controls_[RfSpan]))), static_cast<unsigned>(baud), level); return;
         }
-        case RfClear: rfHistory_.clear(); invalidateArea(28, 577 + 48, canvasWidth_ - 56, canvasHeight_ - 577); return;
+        case RfClear: rfHistory_.clear(); rfPixels_.clear(); invalidateArea(28, 577 + 48, canvasWidth_ - 56, canvasHeight_ - 577); return;
+        case AudioUnattended: unattended_ = !unattended_; savePreferences(); updateAudio(); return;
         case ScopeRouting: page_ = 3; layout(); updateAudio(); return;
         case ScopeFreeze:
             scope_.frozen = !scope_.frozen;
@@ -1372,7 +1375,7 @@ void Dashboard::command(int id, int notification) {
         case AudioReceive: case ScopeReceive: toggleAudio(false); return;
         case AudioMicrophone: toggleAudio(true); return;
         case Ptt: case PttLatch:
-            if (pttLatched_ || pttPending_ || state_.dashboardPtt) { releasePtt(); return; }
+            if (pttLatched_ || pttPending_ || state_.dashboardPtt || state_.releasePending) { releasePtt(); return; }
             {
                 browserPttOwner_ = 0;
                 const long limits[]{30, 60, 180, 300, 600};
@@ -1427,16 +1430,78 @@ void Dashboard::editSelected() {
 void Dashboard::releasePtt() {
     browserPttOwner_ = 0;
     audio::browserAudio().microphoneOwner(0, false);
-    if (!pttLatched_ && !pttPending_ && !state_.dashboardPtt) return;
+    if (!pttLatched_ && !pttPending_ && !state_.dashboardPtt && !state_.releasePending) return;
     pttLatched_ = pttPending_ = false;
     microphoneAudio_.gate(false);
     radio::Command cmd; cmd.action = radio::Action::PttOff; send(cmd);
     InvalidateRect(controls_[Ptt], nullptr, FALSE);
     InvalidateRect(controls_[PttLatch], nullptr, FALSE);
 }
+void Dashboard::postUi(std::function<void()> completion) {
+    auto* job = new std::function<void()>(std::move(completion));
+    if (!PostMessageW(window_,dashboard_id::CompletionMessage,0,reinterpret_cast<LPARAM>(job))) delete job;
+}
+void Dashboard::stopRoute(audio::Route& route) {
+    route.requestStop();
+    if (closing_) route.stop();
+    else audioJobs_.submit([&route] { route.stop(); });
+}
+void Dashboard::applyRfSettings(std::wstring port, unsigned span, unsigned baud, double level, std::shared_ptr<web::Request> request) {
+    station_settings::scope({{"rfCat2Port",narrow(port)},{"rfSpan",std::to_string(span)},{"rfCat2Baud",std::to_string(baud)},{"rfWaterfallLevel",std::to_string(level)}},true);
+    if (rfApplying_) throw std::invalid_argument("A scope settings change is already in progress");
+    rfApplying_ = true; rfApplyStatus_ = L"Applying scope settings via CAT-2…";
+    EnableWindow(controls_[RfApplySpan],FALSE);
+    const auto access = request ? request->accessRevision : 0;
+    scopeJobs_.submit([this,port,span,baud,level,request,access] {
+        std::wstring result;
+        try {
+            if (request && (!webServer_ || access != webServer_->accessRevision())) result = L"Web passcode changed; scope request cancelled";
+            else result = scopeApply_(port,span,baud,level);
+        }
+        catch (const std::exception& e) { result = wide(e.what()); }
+        postUi([this,span,level,request,access,result=std::move(result)] {
+            rfApplying_ = false; EnableWindow(controls_[RfApplySpan],TRUE);
+            std::wostringstream label; label << std::fixed << std::setprecision(1) << level;
+            rfApplyStatus_ = result.empty() ? L"Radio confirmed " + rf_scope::spanLabel(span) + L" span / " + label.str() + L" dB" : result;
+            savePreferences(); log(rfApplyStatus_); publishWeb(true);
+            if (request) {
+                const auto error = !result.empty() ? result : preferencesError_;
+                if (!webServer_ || access != webServer_->accessRevision()) request->reply.set_value("\"ok\":false,\"error\":\"Web passcode changed; sign in again\"");
+                else request->reply.set_value(error.empty() ? "\"ok\":true,\"queued\":false" : "\"ok\":false,\"error\":" + web::json(narrow(error)));
+            }
+        });
+    });
+    publishWeb(true);
+}
+void Dashboard::browserMicrophone(std::uint64_t client, bool armed) {
+    if (armed) {
+        browserMicClients_.insert(client);
+        try { if (!microphoneWanted_) toggleAudio(true); }
+        catch (...) { browserMicClients_.erase(client); throw; }
+    } else {
+        const bool registered = browserMicClients_.erase(client) != 0;
+        if (browserPttOwner_ == client) releasePtt();
+        if (registered && browserMicClients_.empty() && audioSelectedIds_[2] == audio::BrowserMicrophone && microphoneWanted_)
+            toggleAudio(true);
+    }
+    updateAudio();
+}
 void Dashboard::refreshAudioDevices() {
-    try { audioDevices_ = audio::devices(); audioError_.clear(); }
-    catch (const std::exception& error) { audioDevices_.clear(); audioError_ = L"Cannot enumerate Windows audio devices: " + wide(error.what()); log(audioError_); }
+    if (audioRefreshing_) return;
+    audioRefreshing_ = true; const auto revision = ++audioRefreshRevision_;
+    audioJobs_.submit([this,revision] {
+        std::vector<audio::Device> devices; std::wstring error;
+        try { devices = audio::devices(); }
+        catch (const std::exception& e) { error = L"Cannot enumerate Windows audio devices: " + wide(e.what()); }
+        postUi([this,revision,devices=std::move(devices),error=std::move(error)]() mutable {
+            if (revision != audioRefreshRevision_) return;
+            audioRefreshing_ = false; applyAudioDevices(std::move(devices),std::move(error)); publishWeb(true);
+        });
+    });
+}
+void Dashboard::applyAudioDevices(std::vector<audio::Device> devices, std::wstring error) {
+    audioDevices_ = std::move(devices); audioError_ = std::move(error);
+    if (!audioError_.empty()) log(audioError_);
     if (!audio::directDeviceIssue().empty()) { audioError_ = L"Direct hardware audio: " + audio::directDeviceIssue(); log(audioError_); }
     unsigned hardwareInputs = 0, hardwareOutputs = 0, remoteInputs = 0, remoteOutputs = 0;
     for (const auto& device : audioDevices_) {
@@ -1466,15 +1531,16 @@ void Dashboard::refreshAudioDevices() {
     updating_ = previousUpdating; updateAudio();
 }
 void Dashboard::stopAudio() {
+    browserMicClients_.clear();
     receiveWanted_ = microphoneWanted_ = false;
-    receiveAudio_.stop(); microphoneAudio_.stop();
+    stopRoute(receiveAudio_); stopRoute(microphoneAudio_);
     audio::browserAudio().microphoneOwner(0, false);
 }
 void Dashboard::toggleAudio(bool microphone) {
     bool& wanted = microphone ? microphoneWanted_ : receiveWanted_;
     auto& route = microphone ? microphoneAudio_ : receiveAudio_;
     if (wanted) {
-        wanted = false; route.stop(); if (microphone) releasePtt();
+        wanted = false; stopRoute(route); if (microphone) releasePtt();
     } else {
         if (!state_.online || state_.demo) throw std::invalid_argument("Connect to the physical radio before enabling audio routing.");
         int slot = microphone ? 2 : 0;
@@ -1489,15 +1555,20 @@ void Dashboard::toggleAudio(bool microphone) {
         double value = numberOf(controls_[microphone ? AudioMicrophoneGain : AudioReceiveGain]);
         if (value < 0 || value > 100 || value != std::trunc(value)) throw std::invalid_argument("Audio level must be a whole percent from 0 to 100.");
         route.gain(static_cast<float>(value / 100));
-        route.start(audioSelectedIds_[slot], audioSelectedIds_[slot + 1]); wanted = true;
+        const auto source = audioSelectedIds_[slot], destination = audioSelectedIds_[slot + 1]; wanted = true;
+        audioJobs_.submit([this,&route,source,destination] {
+            try { route.start(source,destination); }
+            catch (const std::exception& e) { postUi([this,message=wide(e.what())] { audioError_ = message; log(message); }); }
+        });
         log(microphone ? L"Microphone route enabled; radio output is gated by dashboard PTT." : L"Receive audio route enabled; it mutes during TX.");
     }
     savePreferences(); updateAudio();
 }
 void Dashboard::updateAudio() {
+    textIfChanged(controls_[AudioUnattended],unattended_ ? L"Unattended browser audio: On" : L"Unattended browser audio: Off");
     auto receive = receiveAudio_.status(), microphone = microphoneAudio_.status();
-    if (receiveWanted_ && !receive.active && !receive.starting) { receiveWanted_ = false; log(L"Receive audio stopped: " + receive.text); }
-    if (microphoneWanted_ && !microphone.active && !microphone.starting) {
+    if (receiveWanted_ && !receive.active && !receive.starting && receive.text != L"Off") { receiveWanted_ = false; log(L"Receive audio stopped: " + receive.text); }
+    if (microphoneWanted_ && !microphone.active && !microphone.starting && microphone.text != L"Off") {
         microphoneWanted_ = false; microphoneAudio_.gate(false); releasePtt(); log(L"Microphone audio stopped: " + microphone.text);
     }
     receiveAudio_.gate(receiveWanted_ && state_.online && state_.pttKnown && !state_.transmitting);
@@ -1540,48 +1611,44 @@ void Dashboard::updateScope() {
 void Dashboard::updateRfScope() {
     const auto status = rfCapture_.status();
     bool changed = status != rfUiStatus_;
-    rfUiStatus_ = status;
+    rfUiStatus_ = rfCaptureChanging_ ? (rfCaptureWanted_ ? L"Starting RF capture…" : L"Stopping RF capture…") : status;
+    if (!rfCaptureChanging_) rfCaptureWanted_ = rfCapture_.running();
+    if (rfCapture_.running() && rfFrame_.valid && !rfFrame_.fresh()) rfUiStatus_ = L"RF capture stalled · frozen history";
     textIfChanged(controls_[RfCapture], rfCapture_.running() ? L"Stop RF capture" : L"Start RF capture");
     refreshButton(RfCapture);
     rf_scope::Frame next;
-    if (rfCapture_.latest(next) && next.sequence != rfRenderedSequence_) {
+    if (rfCaptureWanted_ && rfCapture_.running() && rfCapture_.latest(next) && next.fresh() && next.sequence != rfRenderedSequence_) {
         rfRenderedSequence_ = next.sequence;
         const auto& active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
         if (!next.frequencyValid && active.frequencyValid) { next.centerHz = static_cast<std::uint64_t>(std::llround(active.frequency)); next.frequencyValid = true; }
+        if (rfFrame_.generation != next.generation || rfFrame_.centerHz != next.centerHz || rfFrame_.spanIndex != next.spanIndex) {
+            rfHistory_.clear(); rfPixels_.clear();
+        }
         rfFrame_ = next;
         rfHistory_.push_front(next.bins);
         if (rfHistory_.size() > 2048) rfHistory_.pop_back();
         if (webServer_) webServer_->rfSpectrum(rfFrame_, rfFrame_.centerHz, rf_scope::spanHz(rfFrame_.spanIndex));
-        if (rfFrame_.spanIndex < 10) selectionIfChanged(controls_[RfSpan], static_cast<int>(rfFrame_.spanIndex));
+        // The span editor is a draft; the frame and its axis remain radio readback.
         changed = true;
     }
     const auto& active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
     auto center = rfFrame_.frequencyValid ? rfFrame_.centerHz : active.frequencyValid ? static_cast<std::uint64_t>(std::llround(active.frequency)) : 0;
     if (center != rfRenderedCenterHz_) { rfRenderedCenterHz_ = center; changed = true; }
     if (page_ == 5 && changed) invalidateArea(28, 228 + 48, canvasWidth_ - 56, canvasHeight_ - 228);
+    EnableWindow(controls_[RfApplySpan],!rfApplying_);
 }
 bool Dashboard::setRfCapture(bool enabled) {
-    if (enabled) {
-        if (!rfCapture_.running()) {
-            rfHistory_.clear();
-            if (!rfCapture_.start()) {
-                rfUiStatus_ = rfCapture_.status();
-                log(rfUiStatus_);
-                updateRfScope();
-                publishWeb(true);
-                return false;
-            }
-        }
-    } else if (rfCapture_.running()) {
-        rfCapture_.stop();
-    }
-    rfUiStatus_ = rfCapture_.status();
-    textIfChanged(controls_[RfCapture], rfCapture_.running() ? L"Stop RF capture" : L"Start RF capture");
-    refreshButton(RfCapture);
-    log(rfUiStatus_);
-    updateRfScope();
-    publishWeb(true);
-    return !enabled || rfCapture_.running();
+    rfCaptureWanted_ = enabled;
+    rfCaptureChanging_ = true; const auto revision = ++rfOperationRevision_;
+    if (!enabled) rfCapture_.requestStop();
+    rfFrame_ = {}; rfHistory_.clear(); rfPixels_.clear(); rfRenderedSequence_ = 0;
+    if (webServer_) webServer_->rfSpectrum({},0,0);
+    rfUiStatus_ = enabled ? L"Starting RF capture…" : L"Stopping RF capture…";
+    scopeJobs_.submit([this,enabled,revision] {
+        if (enabled) rfCapture_.start(); else rfCapture_.stop();
+        postUi([this,revision] { if (revision == rfOperationRevision_) rfCaptureChanging_ = false; updateRfScope(); publishWeb(true); });
+    });
+    publishWeb(true); return true;
 }
 void Dashboard::exportCsv() {
     releasePtt();
@@ -1609,7 +1676,12 @@ void Dashboard::exportCsv() {
 }
 void Dashboard::savePreferences() {
     if (iniPath_.empty() || !capturePath_.empty() || preview_) return;
-    auto save = [&](const wchar_t* key, const std::wstring& value) { WritePrivateProfileStringW(L"Connection", key, value.c_str(), iniPath_.c_str()); };
+    const auto previousError = preferencesError_; preferencesError_.clear();
+    auto writeIni = [&](const wchar_t* section, const wchar_t* key, const wchar_t* value, const wchar_t* path) {
+        if (!WritePrivateProfileStringW(section,key,value,path) && preferencesError_.empty())
+            preferencesError_ = L"Cannot save settings (Windows error " + std::to_wstring(GetLastError()) + L"). Check access to " + iniPath_;
+    };
+    auto save = [&](const wchar_t* key, const std::wstring& value) { writeIni(L"Connection", key, value.c_str(), iniPath_.c_str()); };
     save(L"Kind", std::to_wstring(selected(controls_[ConnectionKind])));
     save(L"Endpoint", textOf(controls_[Endpoint]));
     save(L"ShareCAT", sharingWanted_ ? L"1" : L"0");
@@ -1618,22 +1690,25 @@ void Dashboard::savePreferences() {
         save(name, std::to_wstring(selected(controls_[id])));
     const wchar_t* audioKeys[]{L"ReceiveSource", L"ReceiveDestination", L"MicrophoneSource", L"MicrophoneDestination"};
     for (int i = 0; i < 4; ++i) {
-        WritePrivateProfileStringW(L"Audio", audioKeys[i], audioSelectedIds_[i].c_str(), iniPath_.c_str());
-        WritePrivateProfileStringW(L"Audio", (std::wstring(audioKeys[i]) + L"Name").c_str(), audioSelectedNames_[i].c_str(), iniPath_.c_str());
+        writeIni(L"Audio", audioKeys[i], audioSelectedIds_[i].c_str(), iniPath_.c_str());
+        writeIni(L"Audio", (std::wstring(audioKeys[i]) + L"Name").c_str(), audioSelectedNames_[i].c_str(), iniPath_.c_str());
     }
-    WritePrivateProfileStringW(L"Audio", L"ReceiveLevel", textOf(controls_[AudioReceiveGain]).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"Audio", L"MicrophoneLevel", textOf(controls_[AudioMicrophoneGain]).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"Audio", L"PttLimit", std::to_wstring(selected(controls_[AudioPttLimit])).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"Tuning", L"Step", std::to_wstring(selected(controls_[Step])).c_str(), iniPath_.c_str());
+    writeIni(L"Audio", L"ReceiveLevel", textOf(controls_[AudioReceiveGain]).c_str(), iniPath_.c_str());
+    writeIni(L"Audio", L"MicrophoneLevel", textOf(controls_[AudioMicrophoneGain]).c_str(), iniPath_.c_str());
+    writeIni(L"Audio", L"PttLimit", std::to_wstring(selected(controls_[AudioPttLimit])).c_str(), iniPath_.c_str());
+    writeIni(L"Audio", L"Unattended", unattended_ ? L"1" : L"0", iniPath_.c_str());
+    writeIni(L"Tuning", L"Step", std::to_wstring(selected(controls_[Step])).c_str(), iniPath_.c_str());
     for (auto [id, key] : {std::pair{ScopeSpan, L"Span"}, std::pair{ScopeGain, L"Gain"}, std::pair{ScopeFloor, L"Floor"}})
-        WritePrivateProfileStringW(L"Scope", key, std::to_wstring(selected(controls_[id])).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"RfScope", L"Span", std::to_wstring(selected(controls_[RfSpan])).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"RfScope", L"Cat2Port", textOf(controls_[RfCat2Port]).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"RfScope", L"Cat2Baud", std::to_wstring(selected(controls_[RfCat2Baud])).c_str(), iniPath_.c_str());
-    WritePrivateProfileStringW(L"RfScope", L"WaterfallLevelDb", textOf(controls_[RfWaterfallLevel]).c_str(), iniPath_.c_str());
+        writeIni(L"Scope", key, std::to_wstring(selected(controls_[id])).c_str(), iniPath_.c_str());
+    writeIni(L"RfScope", L"Span", std::to_wstring(selected(controls_[RfSpan])).c_str(), iniPath_.c_str());
+    writeIni(L"RfScope", L"Cat2Port", textOf(controls_[RfCat2Port]).c_str(), iniPath_.c_str());
+    writeIni(L"RfScope", L"Cat2Baud", std::to_wstring(selected(controls_[RfCat2Baud])).c_str(), iniPath_.c_str());
+    writeIni(L"RfScope", L"WaterfallLevelDb", textOf(controls_[RfWaterfallLevel]).c_str(), iniPath_.c_str());
+    if (!preferencesError_.empty() && preferencesError_ != previousError) log(preferencesError_);
 }
 void Dashboard::loadPreferences() {
     if (iniPath_.empty()) return;
+    unattended_ = GetPrivateProfileIntW(L"Audio",L"Unattended",0,iniPath_.c_str()) != 0;
     auto read = [&](const wchar_t* key, int fallback, int max) { return std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Connection", key, fallback, iniPath_.c_str())), 0, max); };
     SendMessageW(controls_[ConnectionKind], CB_SETCURSEL, read(L"Kind", 0, 2), 0);
     SendMessageW(controls_[Baud], CB_SETCURSEL, read(L"Baud", 3, 4), 0);
@@ -1829,7 +1904,7 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_COMMAND: command(LOWORD(wp), HIWORD(wp)); return 0;
     case WM_LBUTTONUP: {
-        if (page_ == 5 && rfFrame_.valid) {
+        if (page_ == 5 && rfCapture_.running() && rfFrame_.fresh()) {
             const int x = MulDiv(GET_X_LPARAM(lp), 96, dpi_) + scrollX_;
             const int y = MulDiv(GET_Y_LPARAM(lp), 96, dpi_) + scrollY_;
             const int plotX = 94, plotY = 429 + 48, plotWidth = canvasWidth_ - 140, plotHeight = 105;
@@ -1886,14 +1961,24 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         std::unique_ptr<std::shared_ptr<web::Request>> request(reinterpret_cast<std::shared_ptr<web::Request>*>(lp));
         webCommand(*request); return 0;
     }
+    case CompletionMessage: {
+        std::unique_ptr<std::function<void()>> job(reinterpret_cast<std::function<void()>*>(lp));
+        if (!closing_) { try { (*job)(); } catch (const std::exception& e) { log(wide(e.what())); } }
+        return 0;
+    }
     case WM_WTSSESSION_CHANGE:
         if (wp == WTS_REMOTE_DISCONNECT || wp == WTS_CONSOLE_DISCONNECT || wp == WTS_SESSION_LOCK || wp == WTS_SESSION_LOGOFF) {
-            releasePtt(); stopAudio(); updateAudio(); log(L"Session disconnected/locked: dashboard PTT and audio stopped.");
+            releasePtt();
+            if (!unattended_) stopAudio();
+            else if (audioSelectedIds_[2] != audio::BrowserMicrophone) { microphoneWanted_ = false; stopRoute(microphoneAudio_); }
+            updateAudio(); log(unattended_ ? L"Session ended: PTT released; unattended browser receive audio remains enabled." : L"Session ended: PTT and audio stopped.");
         }
-        if (wp == WTS_REMOTE_CONNECT || wp == WTS_SESSION_UNLOCK) { stopAudio(); refreshAudioDevices(); }
+        if ((wp == WTS_REMOTE_CONNECT || wp == WTS_SESSION_UNLOCK) && !unattended_) { stopAudio(); refreshAudioDevices(); }
         return 0;
     case WM_CLOSE: {
+        closing_ = true;
         releasePtt(); stopAudio(); savePreferences(); WTSUnRegisterSessionNotification(window_);
+        audioJobs_.stop(); scopeJobs_.stop();
         if (webServer_) webServer_->stop();
         if (catServer_) catServer_->stop();
         if (worker_) worker_->stop();
@@ -1904,6 +1989,7 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
             if (pending.message == LogMessage) delete reinterpret_cast<std::wstring*>(pending.lParam);
         }
         while (PeekMessageW(&pending, window_, WebMessage, WebMessage, PM_REMOVE)) delete reinterpret_cast<std::shared_ptr<web::Request>*>(pending.lParam);
+        while (PeekMessageW(&pending, window_, CompletionMessage, CompletionMessage, PM_REMOVE)) delete reinterpret_cast<std::function<void()>*>(pending.lParam);
         DestroyWindow(window_); return 0;
     }
     case WM_DESTROY: PostQuitMessage(0); return 0;

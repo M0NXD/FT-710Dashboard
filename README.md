@@ -1,6 +1,6 @@
 # FT-710 Dashboard — Remote Control for Yaesu FT-710
 
-A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.4** also provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.5** also provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The GitHub release contains the compiled application and documentation only; it does not bundle third-party runtime DLLs. The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
 
 ## Remote control at a glance
 
@@ -8,7 +8,7 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 ### Runtime dependencies
 
-The release ZIP contains only `FT710Dashboard.exe` and this README. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** Install the matching **64-bit Hamlib 4.7.2 runtime** and make its `bin` directory available on `PATH`. The application requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. Obtain Hamlib from its [official 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2). If the Hamlib package does not provide a compatible `libwinpthread-1.dll`, install a current x64 POSIX MinGW-w64 distribution such as [WinLibs](https://winlibs.com/) and make its `mingw64/bin` directory available on `PATH`.
+The release ZIP contains `FT710Dashboard.exe`, this README, and `check-runtime.ps1`. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** Install the matching **64-bit Hamlib 4.7.2 runtime** and make its `bin` directory available on `PATH`. The application requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. Obtain Hamlib from its [official 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2). If the Hamlib package does not provide a compatible `libwinpthread-1.dll`, install a current x64 POSIX MinGW-w64 distribution such as [WinLibs](https://winlibs.com/) and make its `mingw64/bin` directory available on `PATH`.
 
 The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Download them from [FTDI's FT4222H software examples](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
 
@@ -63,7 +63,7 @@ CAT-1 and CAT-2 must be different COM ports. The dashboard owns CAT-1 for as lon
 
 The RF scope level adjusts the radio's waterfall reference level, not RF power or receiver gain. The scope shows the FT-710's displayed RF levels across its selected span; only the tuned receiver demodulates audio. The separate **Audio scope** displays received audio and uses the selected audio capture route.
 
-The x64 FTDI runtime DLLs are required at build time and beside the executable at runtime. Obtain them from [FTDI's FT4222H software examples/downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place `FTD2XX.dll` and `LibFT4222.dll` in `runtime/ftdi/`. The files are excluded from Git; see [`runtime/ftdi/README.md`](runtime/ftdi/README.md). The FTDI USB driver is available from [FTDI drivers](https://ftdichip.com/drivers/).
+The x64 FTDI runtime DLLs are optional at build time and required beside the executable only when using RF capture. Obtain them from [FTDI's FT4222H software examples/downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place `FTD2XX.dll` and `LibFT4222.dll` in `runtime/ftdi/`. The files are excluded from Git; see [`runtime/ftdi/README.md`](runtime/ftdi/README.md). The FTDI USB driver is available from [FTDI drivers](https://ftdichip.com/drivers/).
 
 ## Connect your FT-710
 
@@ -99,7 +99,7 @@ Browser microphone capture requires a [secure context](https://developer.mozilla
 
 For Windows or another device, download **`http://<PC-IP>:8888/certificate.cer`** and install the public root certificate using that device's trust settings. The application exports `web-certificate.cer` and `ft710-station.mobileconfig` beside `settings.ini`. It keeps private keys in the current Windows user's cryptographic key store and does not install a trusted root automatically.
 
-If HTTPS hangs while HTTP setup opens, make sure you are running version 2.0.4, have installed the profile **and enabled full trust**, and are using an address listed by **Web: 8888**. Close the Safari tab and open a fresh tab after enabling trust. Check that the PC and phone clocks are correct. TLS negotiation failures appear in the native Activity log. If the PC address changed after launching the app, restart it to refresh certificate SANs.
+If HTTPS hangs while HTTP setup opens, make sure you are running version 2.0.5, have installed the profile **and enabled full trust**, and are using an address listed by **Web: 8888**. Close the Safari tab and open a fresh tab after enabling trust. Check that the PC and phone clocks are correct. TLS negotiation failures appear in the native Activity log. If the PC address changed after launching the app, restart it to refresh certificate SANs.
 
 On iPhone, allow microphone access when **Arm browser microphone** requests it. Safari uses the phone's system audio output; choose the speaker or headset using the phone's audio controls. Receive playback can use scheduled Web Audio buffers when AudioWorklet is unavailable, but microphone capture requires AudioWorklet support.
 
@@ -253,7 +253,7 @@ PTT from either dashboard button is released by the app; PTT initiated by a micr
 
 ## Build
 
-Requires Windows x64, MinGW-w64 `gcc`/`g++`, CMake 3.24+ and Ninja on PATH. The project uses Win32/common controls/GDI rather than requiring a GUI framework installation. Hamlib is dynamically linked; the build script downloads the official 4.7.2 Windows SDK and verifies its pinned SHA256. It also obtains SHA256-pinned PortAudio 19.7.0 and statically builds the WASAPI/WDM-KS drivers. The RF scope also needs the x64 FTDI runtime files: download `FTD2XX.dll` and `LibFT4222.dll` from [FTDI's FT4222H downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them in `runtime/ftdi/`. The build copies required runtime DLLs beside the executable; third-party files are not tracked in Git. Packaging takes the threading and GCC runtime DLLs from the actual compiler, so newer compilers receive their required `clock_gettime64` implementation.
+Requires Windows x64, MinGW-w64 `gcc`/`g++`, CMake 3.24+ and Ninja on PATH. The project uses Win32/common controls/GDI rather than requiring a GUI framework installation. Hamlib is dynamically linked; the build script downloads the official 4.7.2 Windows SDK and verifies its pinned SHA256. It also obtains SHA256-pinned PortAudio 19.7.0 and statically builds the WASAPI/WDM-KS drivers. To stage RF capture dependencies for local use, optionally provide the x64 FTDI runtime files: download `FTD2XX.dll` and `LibFT4222.dll` from [FTDI's FT4222H downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them in `runtime/ftdi/`. The build copies required runtime DLLs beside the executable; third-party files are not tracked in Git. Packaging takes the threading and GCC runtime DLLs from the actual compiler, so newer compilers receive their required `clock_gettime64` implementation.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
@@ -349,3 +349,43 @@ Hamlib 4.7.2 is dynamically linked using its FT-710 backend. See the [official H
 - [Yaesu FT-710 downloads and USB driver](https://yaesu.com/product-detail.aspx?CatName=HF+Transceivers%2FAmplifiers&Model=FT-710)
 
 Physical FT-710 operation needs checking with your connected radio. A successful build or Dummy connection does not verify the USB driver, CAT configuration, firmware behavior, transmitted meter calibration, or standby wake-up on your hardware.
+
+## Reliability and phone audio in 2.0.5
+
+PTT-off failures are retried by the radio worker, including releases for disconnected Hamlib clients. A pending release prevents new dashboard or CAT PTT-on requests. Scope CAT-2 writes/readback and device refresh/start/stop run in background queues so the GUI and browser controls remain available.
+
+Browser station settings show **Saving**, **Saved**, or a failure with **Retry save**. Save responses acknowledge individual edit revisions, preserving newer drafts and limiting updates to the fields that browser changed. An INI write failure is reported. The RF span editor is a requested setting; received frames supply the confirmed display span.
+
+Drag/wheel tuning sends accumulated changes at a bounded rate during the gesture. RF waterfall history clears when its center/span or capture generation changes. Stopped/stalled capture is labelled as frozen history, and tuning requires a fresh frame. Waterfall image buffers are reused and updated incrementally. Browsers subscribe to visible scopes; live state uses incremental updates and activity-log append/trim messages.
+
+On devices supporting the Audio Session API, **Keep a stable microphone/playback session** selects play-and-record before listening/capture and keeps that session while listening. This avoids an unnecessary session transition when arming the mic; the phone still determines its speaker/headset route and volume. This is not a guarantee that every Safari/iOS output-volume issue is resolved. The option can be disabled. Interrupted audio has **Resume audio**; a lost/hidden/disconnected mic is disarmed and its owned PTT is released. A page restored with browser Back/Forward reconnects without automatically re-keying. Local mic arming is tracked per browser, so one browser disarming cannot tear down another browser's active mic route.
+
+The saved **Unattended browser audio** option in the native Audio routing page, or its equivalent browser option, allows receive audio to continue when Windows locks or RDP disconnects. PTT is still released on that session change. New browser PTT remains an explicit action. The option defaults to off. The browser **Connection & audio diagnostics** panel reports CAT contact age, RF age, command acknowledgement time, audio-context/session state and drawing time.
+
+## Check dependencies and package a release
+
+Before launching a downloaded executable, run the included helper from its folder:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\check-runtime.ps1
+```
+
+It checks x64 runtime discovery, Hamlib 4.7.2 loading/version and the compiler threading runtime's `clock_gettime64` export. It lists optional FTDI runtime files separately and links to upstream downloads. It does not install dependencies. For a local staged build use `scripts/check-runtime.ps1 -ApplicationDirectory dist`. The default Windows loader must be able to find the DLLs before the executable can start.
+
+Create the application-only release after building:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
+```
+
+The script uses an explicit allowlist, verifies the ZIP contents, and writes a SHA-256 checksum under ignored `artifacts/releases/`. It includes only the executable, README and runtime-check helper; Hamlib, FTDI and other third-party runtime DLLs are excluded. Local `dist/` staging retains separately obtained dependencies for running the app.
+
+Offline regression checks are registered with CTest:
+
+```powershell
+cmake -S . -B build -DBUILD_GUI_CHECKS=ON -DBUILD_RADIO_CHECKS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Node.js is needed only for the browser regression tests, not for deployment. The checks include PTT release fault injection, all six native pages, delayed preference acknowledgements, continuous tuning, RF-grid transitions, browser mic ownership and native-server/browser state-delta round trips. The Windows GitHub Actions workflow builds without FTDI DLLs, runs the offline checks, and uploads only the validated application release archive. Hardware/phone acceptance checks still need the actual FT-710 and browser.

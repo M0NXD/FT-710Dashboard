@@ -1,5 +1,6 @@
 #include "dashboard.hpp"
 #include "dashboard_ids.hpp"
+#include "station_settings.hpp"
 #include <shellapi.h>
 #include <filesystem>
 #include <cmath>
@@ -143,9 +144,11 @@ void Dashboard::publishWeb(bool urgent) {
     out << "{\"type\":\"state\",\"generation\":" << s.generation << ",\"online\":" << boolean(s.online) << ",\"portOpen\":" << boolean(s.portOpen)
         << ",\"busy\":" << boolean(s.busy) << ",\"demo\":" << boolean(s.demo) << ",\"poweredOff\":" << boolean(s.poweredOff)
         << ",\"standby\":" << boolean(s.standby) << ",\"powerKnown\":" << boolean(s.powerKnown)
+        << ",\"contactAge\":" << (s.lastContact == std::chrono::steady_clock::time_point{} ? -1LL : std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s.lastContact).count())
+        << ",\"preferencesError\":" << web::json(utf8(preferencesError_))
         << ",\"canPower\":" << boolean(s.canPower) << ",\"canPtt\":" << boolean(s.canPtt) << ",\"pttKnown\":" << boolean(s.pttKnown)
         << ",\"transmitting\":" << boolean(s.transmitting) << ",\"dashboardPtt\":" << boolean(s.dashboardPtt)
-        << ",\"pttPending\":" << boolean(pttPending_) << ",\"browserOwner\":" << browserPttOwner_ << ",\"micLease\":" << audio::browserAudio().lease()
+        << ",\"pttPending\":" << boolean(pttPending_) << ",\"releasePending\":" << boolean(s.releasePending) << ",\"browserOwner\":" << browserPttOwner_ << ",\"micLease\":" << audio::browserAudio().lease()
         << ",\"status\":" << web::json(s.connectionStatus) << ",\"error\":" << web::json(s.error) << ",\"activeVfo\":" << web::json(s.activeVfo == RIG_VFO_B ? "B" : "A")
         << ",\"settingsVfo\":" << web::json(s.settingsVfo == RIG_VFO_A ? "A" : s.settingsVfo == RIG_VFO_B ? "B" : "Current") << ",\"modes\":" << array(s.modes) << ",\"vfos\":[";
     for (int i = 0; i < 2; ++i) {
@@ -182,13 +185,19 @@ void Dashboard::publishWeb(bool urgent) {
         << ",\"receiveText\":" << web::json(utf8(rx.text)) << ",\"microphoneText\":" << web::json(utf8(mic.text))
         << ",\"inputPeak\":" << rx.inputPeak << ",\"outputPeak\":" << rx.outputPeak << ",\"micInputPeak\":" << mic.inputPeak << ",\"micOutputPeak\":" << mic.outputPeak
         << ",\"receiveLevel\":" << web::json(text(controls_[AudioReceiveGain])) << ",\"microphoneLevel\":" << web::json(text(controls_[AudioMicrophoneGain])) << ",\"pttLimit\":" << selected(controls_[AudioPttLimit])
+        << ",\"unattended\":" << boolean(unattended_) << ",\"refreshing\":" << boolean(audioRefreshing_)
         << ",\"error\":" << web::json(utf8(audioError_)) << "},\"scope\":{\"fresh\":" << boolean(webSpectrumTick_ && GetTickCount64() - webSpectrumTick_ < 500) << ",\"generated\":" << boolean(scopeDemo_ && s.demo) << "},\"rfScope\":{";
     rf_scope::Frame rfFrame; const bool haveRfFrame = rfCapture_.latest(rfFrame);
     const auto& activeVfo = s.activeVfo == RIG_VFO_B ? s.b : s.a;
     const auto rfCenter = rfFrame.frequencyValid ? rfFrame.centerHz : activeVfo.frequencyValid ? static_cast<std::uint64_t>(std::llround(activeVfo.frequency)) : 0;
     const auto rfSpanIndex = haveRfFrame && rfFrame.spanIndex < 10 ? rfFrame.spanIndex : static_cast<unsigned>(std::max(0, selected(controls_[RfSpan])));
-    out << "\"running\":" << boolean(rfCapture_.running()) << ",\"frameValid\":" << boolean(haveRfFrame)
-        << ",\"status\":" << web::json(utf8(rfCapture_.status())) << ",\"spanIndex\":" << rfSpanIndex
+    const bool rfFresh = haveRfFrame && rfFrame.fresh() && rfCapture_.running() && rfCaptureWanted_ && !rfCaptureChanging_;
+    out << "\"running\":" << boolean(rfCapture_.running()) << ",\"wanted\":" << boolean(rfCaptureWanted_) << ",\"frameValid\":" << boolean(rfFresh)
+        << ",\"generation\":" << rfFrame.generation << ",\"sequence\":" << rfFrame.sequence
+        << ",\"age\":" << (haveRfFrame ? static_cast<long long>(GetTickCount64() - rfFrame.acquiredAt) : -1)
+        << ",\"applying\":" << boolean(rfApplying_) << ",\"applyStatus\":" << web::json(utf8(rfApplyStatus_))
+        << ",\"requestedSpanIndex\":" << selected(controls_[RfSpan])
+        << ",\"status\":" << web::json(utf8(rfUiStatus_)) << ",\"spanIndex\":" << rfSpanIndex
         << ",\"spanHz\":" << rf_scope::spanHz(rfSpanIndex) << ",\"centerHz\":" << rfCenter
         << ",\"cat2Port\":" << web::json(text(controls_[RfCat2Port])) << ",\"cat2Baud\":" << web::json(text(controls_[RfCat2Baud]))
         << ",\"levelDb\":" << web::json(text(controls_[RfWaterfallLevel])) << "},\"activity\":[";
@@ -200,7 +209,7 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
         const auto& f = request->fields;
         auto get = [&](const char* key) { auto it = f.find(key); return it == f.end() ? std::string{} : it->second; };
         auto action = get("action");
-        if (action == "browserGone") { if (browserPttOwner_ == request->client) { releasePtt(); updateAudio(); } return; }
+        if (action == "browserGone") { browserMicrophone(request->client,false); return; }
         if (!webServer_ || request->accessRevision != webServer_->accessRevision()) throw std::runtime_error("Web passcode changed; sign in again");
         if (number(get("generation"),0,9007199254740991.0,true) != state_.generation) throw std::runtime_error("Radio connection changed; wait for the latest state");
         radio::Command cmd; std::uint64_t revision = 0;
@@ -208,45 +217,38 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
         if (action == "preferences") {
             // Browser connection and scope edits are persisted in the same INI
             // profile as the native controls, so either interface restores them.
-            const int kind = static_cast<int>(number(get("kind"),0,2,true));
-            const auto endpoint = get("endpoint");
-            if (endpoint.size() > 240 || endpoint.find_first_of("\r\n") != std::string::npos) throw std::invalid_argument("Invalid endpoint");
+            const auto connection = station_settings::connection(f);
+            const auto scope = station_settings::scope(f);
+            const auto kind = static_cast<int>(connection.type);
+            const auto& endpoint = connection.endpoint; const auto& port = scope.port;
+            const auto span = scope.span, baud = scope.baud;
+            std::wstring levelValue;
+            if (scope.level) { std::wostringstream levelText;levelText << std::fixed << std::setprecision(1) << *scope.level;levelValue=levelText.str(); }
+            auto changed = [&](const char* key) { return get("changed").empty() || ("," + get("changed") + ",").find("," + std::string(key) + ",") != std::string::npos; };
             if (!state_.portOpen && !state_.busy) {
-                SendMessageW(controls_[ConnectionKind],CB_SETCURSEL,kind,0);
-                SetWindowTextW(controls_[Endpoint],wide(endpoint).c_str());
-                choose(controls_[Baud],get("baud")); choose(controls_[StopBits],get("stopBits"));
-                choose(controls_[Flow],get("flow")); choose(controls_[Poll],get("poll"));
+                if (changed("connectionKind")) SendMessageW(controls_[ConnectionKind],CB_SETCURSEL,kind,0);
+                if (changed("endpoint")) SetWindowTextW(controls_[Endpoint],wide(endpoint).c_str());
+                for (auto [id,key] : {std::pair{Baud,"baud"},std::pair{StopBits,"stopBits"},std::pair{Flow,"flow"},std::pair{Poll,"poll"}}) if (changed(key)) choose(controls_[id],get(key));
             }
-            const auto port = get("rfCat2Port");
-            if (port.size() > 15 || port.find_first_of("\r\n") != std::string::npos ||
-                (!port.empty() && (port.size() < 4 || std::toupper(static_cast<unsigned char>(port[0])) != 'C' ||
-                 std::toupper(static_cast<unsigned char>(port[1])) != 'O' || std::toupper(static_cast<unsigned char>(port[2])) != 'M' ||
-                 !std::all_of(port.begin() + 3,port.end(),[](unsigned char c) { return std::isdigit(c); }))))
-                throw std::invalid_argument("Enter the radio Standard / CAT-2 COM port, for example COM5");
-            const auto span = static_cast<unsigned>(number(get("rfSpan"),0,9,true));
-            const auto baud = static_cast<unsigned>(number(get("rfCat2Baud"),4800,115200,true));
-            static constexpr unsigned allowedBaud[]{4800,9600,19200,38400,115200};
-            if (std::find(std::begin(allowedBaud),std::end(allowedBaud),baud) == std::end(allowedBaud)) throw std::invalid_argument("Select a supported CAT-2 baud rate");
-            SetWindowTextW(controls_[RfCat2Port],wide(port).c_str());
-            SendMessageW(controls_[RfSpan],CB_SETCURSEL,span,0);
-            choose(controls_[RfCat2Baud],std::to_string(baud));
-            if (f.contains("rfWaterfallLevel")) {
-                const auto levelDb = number(get("rfWaterfallLevel"),-30,30);
-                if (std::abs(levelDb * 2.0 - std::round(levelDb * 2.0)) > 0.001) throw std::invalid_argument("Waterfall level must use 0.5 dB steps");
-                std::wostringstream levelText; levelText << std::fixed << std::setprecision(1) << levelDb;
-                SetWindowTextW(controls_[RfWaterfallLevel],levelText.str().c_str());
-            }
+            if (changed("rfCat2Port")) SetWindowTextW(controls_[RfCat2Port],wide(port).c_str());
+            if (changed("rfSpan")) SendMessageW(controls_[RfSpan],CB_SETCURSEL,span,0);
+            if (changed("rfCat2Baud")) choose(controls_[RfCat2Baud],std::to_string(baud));
+            if (changed("rfWaterfallLevel") && !levelValue.empty()) SetWindowTextW(controls_[RfWaterfallLevel],levelValue.c_str());
             savePreferences();
+            if (!preferencesError_.empty()) throw std::runtime_error(utf8(preferencesError_));
         } else if (action == "connect") {
             if (state_.portOpen || state_.busy) throw std::runtime_error("Disconnect the existing connection first");
-            int kind = static_cast<int>(number(get("kind"),0,2,true)); SendMessageW(controls_[ConnectionKind],CB_SETCURSEL,kind,0);
-            auto endpoint = get("endpoint"); if (endpoint.size() > 240 || endpoint.find_first_of("\r\n") != std::string::npos) throw std::invalid_argument("Invalid endpoint");
-            SetWindowTextW(controls_[Endpoint],wide(endpoint).c_str()); choose(controls_[Baud],get("baud")); choose(controls_[StopBits],get("stopBits")); choose(controls_[Flow],get("flow")); choose(controls_[Poll],get("poll")); connect();
+            const auto connection = station_settings::connection(f);
+            SendMessageW(controls_[ConnectionKind],CB_SETCURSEL,static_cast<int>(connection.type),0);
+            SetWindowTextW(controls_[Endpoint],wide(connection.endpoint).c_str());
+            choose(controls_[Baud],std::to_string(connection.baud));choose(controls_[StopBits],std::to_string(connection.stopBits));
+            choose(controls_[Flow],connection.handshake);choose(controls_[Poll],std::to_string(connection.pollMs));connect();
         } else if (action == "disconnect") { if (state_.portOpen) connect(); }
         else if (action == "ptt") {
             if (get("enabled") == "0") { releasePtt(); updateAudio(); }
             else {
-                if (!state_.online || state_.busy || !state_.canPtt || !state_.pttKnown) throw std::runtime_error("Radio PTT is unavailable or TX status is unknown");
+                if (!state_.online || state_.busy || !state_.canPtt || !state_.pttKnown || state_.releasePending) throw std::runtime_error("Radio PTT is unavailable or release is pending");
+                if (browserMicClients_.contains(request->client) && !microphoneAudio_.status().active) throw std::runtime_error("Station microphone audio is still opening; wait for the route to be ready");
                 if (browserPttOwner_ || pttLatched_ || pttPending_ || state_.dashboardPtt || (state_.pttKnown && state_.transmitting)) throw std::runtime_error("PTT is already active; release it first");
                 const long limits[]{30,60,180,300,600}; cmd.action = radio::Action::PttOn; cmd.width = limits[std::clamp(selected(controls_[AudioPttLimit]),0,4)];
                 browserPttOwner_ = request->client; pttLatched_ = pttPending_ = true; pttRequested_ = std::chrono::steady_clock::now(); send(cmd); update(state_);
@@ -259,12 +261,19 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
             if (wanted) startSharing();
             savePreferences(); update(state_);
             if (!sharingError_.empty()) throw std::runtime_error(utf8(sharingError_));
+        } else if (action == "browserMic") {
+            if (get("enabled") == "1" && (!state_.online || state_.demo || audioSelectedIds_[2] != audio::BrowserMicrophone))
+                throw std::runtime_error("Select the browser microphone mapping and connect the radio first");
+            browserMicrophone(request->client,get("enabled") == "1");
+        } else if (action == "unattended") {
+            unattended_ = get("enabled") == "1"; savePreferences();
         } else if (action == "audioRefresh") { releasePtt(); stopAudio(); refreshAudioDevices(); }
         else if (action == "audioMap") {
             unsigned slot = static_cast<unsigned>(number(get("slot"),0,3,true)); auto identity = wide(get("device"));
             auto it = std::find(audioDeviceIds_[slot].begin(),audioDeviceIds_[slot].end(),identity);
             if (it == audioDeviceIds_[slot].end()) throw std::runtime_error("Audio endpoint is unavailable for this mapping");
             if (identity != audioSelectedIds_[slot]) {
+                if (state_.transmitting || pttPending_) throw std::runtime_error("Release PTT before changing shared audio mappings");
                 SendMessageW(controls_[AudioDevice + slot],CB_SETCURSEL,std::distance(audioDeviceIds_[slot].begin(),it),0); command(AudioDevice + slot,CBN_SELCHANGE);
             }
         } else if (action == "audioRoute") {
@@ -281,6 +290,7 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
         } else if (action == "rfStop") {
             setRfCapture(false);
         } else if (action == "rfSpan") {
+            if (rfApplying_) throw std::runtime_error("A scope settings change is already in progress");
             const auto portText = get("port");
             if (portText.size() < 4 || portText.size() > 15 || std::toupper(static_cast<unsigned char>(portText[0])) != 'C' ||
                 std::toupper(static_cast<unsigned char>(portText[1])) != 'O' || std::toupper(static_cast<unsigned char>(portText[2])) != 'M' ||
@@ -297,10 +307,7 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
             choose(controls_[RfCat2Baud],std::to_string(baud));
             std::wostringstream levelText; levelText << std::fixed << std::setprecision(1) << levelDb;
             SetWindowTextW(controls_[RfWaterfallLevel],levelText.str().c_str());
-            auto result = rf_scope::applySpan(wide(portText),spanIndex,baud,levelDb);
-            if (!result.empty()) throw std::runtime_error(utf8(result));
-            rfUiStatus_ = L"Radio confirmed " + rf_scope::spanLabel(spanIndex) + L" span and " + levelText.str() + L" dB waterfall level via CAT-2";
-            savePreferences();
+            applyRfSettings(wide(portText),spanIndex,baud,levelDb,request); return;
         } else if (action == "clearLog") { activity_.clear(); SetWindowTextW(controls_[Activity],L""); }
         else {
             if (action != "powerOn" && action != "powerOff" && (!state_.online || state_.busy)) throw std::runtime_error("Connect to a responsive radio first");
@@ -318,6 +325,8 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
             else throw std::invalid_argument("Unknown web command");
             if (action != "vfo") revision = send(std::move(cmd));
         }
+        if (!preferencesError_.empty() && (action == "audioLevel" || action == "pttLimit" || action == "unattended" || action == "sharing" || action == "audioMap" || action == "audioRoute"))
+            throw std::runtime_error(utf8(preferencesError_));
         publishWeb(action == "ptt"); request->reply.set_value("\"ok\":true,\"queued\":true,\"revision\":" + std::to_string(revision));
     } catch (const std::exception& error) {
         request->reply.set_value("\"ok\":false,\"error\":" + web::json(error.what()));

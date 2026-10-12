@@ -224,14 +224,28 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
             job->reply.set_value(std::move(reply)); return future;
         }
         Command command; command.action = Action::Cat; command.cat = std::move(job);
-        // A client's release follows its already queued requests; disconnect
-        // also cancels requests not yet executed by that client.
-        commands_.push_back(std::move(command));
+        if (release) {
+            for (auto& pending : commands_) if (pending.cat && pending.cat->request.client == command.cat->request.client)
+                pending.cat->cancelled = true;
+            commands_.push_front(std::move(command));
+        } else commands_.push_back(std::move(command));
     }
     wake_.notify_one();
     return future;
 }
 void Worker::publish() { state_.dashboardPtt = heldPtt_; update_(state_); }
+int Worker::releaseTransmit(const std::string& reason) {
+    const int result = rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF);
+    report(reason, result);
+    state_.releasePending = result != RIG_OK;
+    if (state_.releasePending) releaseDeadline_ = Clock::now() + std::chrono::seconds(1);
+    else {
+        heldPtt_ = false; catPttOwner_ = 0;
+        state_.pttKnown = true; state_.transmitting = false;
+        for (auto& setting : state_.settings) if (setting.txOnly) { setting.valid = false; setting.status = "TX only"; }
+    }
+    return result;
+}
 void Worker::report(const std::string& operation, int result) {
     if (result == RIG_OK) {
         log_(operation + " succeeded");
@@ -252,7 +266,8 @@ void Worker::run() {
         {
             std::unique_lock lock(mutex_);
             auto deadline = std::min(nextPoll, nextMeters);
-            if (heldPtt_) deadline = std::min(deadline, pttDeadline_);
+            if (heldPtt_ && !state_.releasePending) deadline = std::min(deadline, pttDeadline_);
+            if (state_.releasePending) deadline = std::min(deadline, releaseDeadline_);
             wake_.wait_until(lock, deadline, [&] { return stopping_ || !commands_.empty(); });
             if (stopping_) break;
             if (!commands_.empty()) {
@@ -262,11 +277,9 @@ void Worker::run() {
             }
         }
         try {
-            if (heldPtt_ && Clock::now() >= pttDeadline_) {
-                int release = rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF);
-                report("Dashboard PTT timeout / release", release);
-                heldPtt_ = release != RIG_OK;
-                if (heldPtt_) pttDeadline_ = Clock::now() + std::chrono::seconds(1);
+            if ((state_.releasePending && Clock::now() >= releaseDeadline_) ||
+                (!state_.releasePending && heldPtt_ && Clock::now() >= pttDeadline_)) {
+                releaseTransmit(state_.releasePending ? "Retry PTT release" : "Dashboard PTT timeout / release");
                 publish();
             }
             if (hasCommand && command.cat) {
@@ -307,7 +320,7 @@ void Worker::run() {
 }
 void Worker::disconnect() {
     if (rig_) {
-        if (heldPtt_ || catPttOwner_) rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF);
+        if (heldPtt_ || catPttOwner_ || state_.releasePending) releaseTransmit("Disconnect PTT release");
         if (state_.portOpen) rig_close(rig_);
         rig_cleanup(rig_);
         rig_ = nullptr;
@@ -656,7 +669,7 @@ void Worker::pollMeters(bool publishUpdate) {
     ptt_t ptt{};
     state_.pttKnown = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt) == RIG_OK;
     state_.transmitting = state_.pttKnown && ptt != RIG_PTT_OFF;
-    if (state_.pttKnown && !state_.transmitting) heldPtt_ = false;
+    if (state_.pttKnown && !state_.transmitting) { heldPtt_ = false; catPttOwner_ = 0; state_.releasePending = false; }
     // Clear TX readings immediately on RX/unknown PTT, even if a queued
     // client request interrupts the remainder of this batch.
     for (auto& s : state_.settings) if (s.txOnly && !state_.transmitting) {
@@ -710,6 +723,7 @@ void Worker::markPoweredOff() {
     state_.poweredOff = true; state_.powerKnown = true; state_.online = false; state_.standby = false;
     state_.connectionStatus = "Powered off"; state_.error.clear(); missed_ = 0;
     state_.transmitting = false; state_.pttKnown = true; heldPtt_ = false; catPttOwner_ = 0;
+    state_.releasePending = false;
     state_.a.frequencyValid = state_.b.frequencyValid = false;
     state_.a.modeValid = state_.b.modeValid = false;
     for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = "Powered off"; }
@@ -806,12 +820,13 @@ void Worker::poll() {
     publish();
 }
 int Worker::power(bool on) {
+    if (on && (heldPtt_ || catPttOwner_ || state_.releasePending || state_.transmitting)) {
+        report("Power on is unavailable during TX or a pending PTT release",-RIG_ERJCTED);publish();return -RIG_ERJCTED;
+    }
     state_.busy = true;
     state_.connectionStatus = on ? "Waking radio..." : "Powering radio off...";
     publish();
-    if (!on && (heldPtt_ || catPttOwner_)) {
-        rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF); heldPtt_ = false; catPttOwner_ = 0;
-    }
+    if (!on && (heldPtt_ || catPttOwner_ || state_.releasePending)) releaseTransmit("Power-off PTT release");
     int result = rig_set_powerstat(rig_, on ? RIG_POWER_ON : RIG_POWER_OFF);
     report(on ? "Power on" : "Power off", result);
     state_.busy = false;
@@ -840,18 +855,7 @@ void Worker::execute(const Command& command) {
     }
     if (!rig_ || !state_.portOpen) throw std::runtime_error("Connect to the radio first.");
     if (command.action == Action::PttOff) {
-        if (heldPtt_) {
-            int release = rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF); report("Release PTT", release);
-            heldPtt_ = release != RIG_OK;
-            if (heldPtt_) pttDeadline_ = Clock::now() + std::chrono::seconds(1);
-            else {
-                state_.pttKnown = true;
-                state_.transmitting = false;
-                for (auto& setting : state_.settings) if (setting.txOnly) {
-                    setting.valid = false; setting.status = "TX only";
-                }
-            }
-        }
+        if (heldPtt_ || state_.releasePending) releaseTransmit("Release PTT");
         publish(); return;
     }
     if (command.action == Action::PowerOn || command.action == Action::PowerOff) {
@@ -913,6 +917,7 @@ void Worker::execute(const Command& command) {
             auto queueMs = command.queuedAt == Clock::time_point{} ? 0LL :
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - command.queuedAt).count();
             auto started = Clock::now();
+        if (state_.releasePending) throw std::runtime_error("PTT release is pending; wait for RX confirmation.");
         if (catPttOwner_) throw std::runtime_error("PTT is already held by a CAT client.");
         {
             ptt_t current{};

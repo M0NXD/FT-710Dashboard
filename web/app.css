@@ -131,3 +131,8 @@
   .settings-tools{gap:10px}
   footer{margin-top:14px;padding:12px 0}
 }
+.preferences-state{display:flex;align-items:center;justify-content:flex-end;gap:12px;color:var(--muted);font-size:.85rem;margin:8px 0}
+.audio-recovery{margin-top:18px;padding:16px;display:grid;gap:12px}
+.audio-recovery .inline{white-space:normal}
+.station-diagnostics{padding:14px;margin:12px 0}
+.station-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.85rem}

@@ -3,6 +3,8 @@ const $ = id => document.getElementById(id), dirty = new Set(), pending = new Ma
 let state, socket, client = 0, sequence = 0, closing = false, reconnectTimer, reconnectDelay = 2000, heartbeat, noticeTimer, preferenceSaveTimer, selectedSetting, stickyOffsetsObserver, stickyNoticeObserver;
 let audioContext, audioSetup, audioNode, listeningGain, micStream, micSource, listening = false, microphone = false, expectedAudio;
 let audioEpoch = 0, microphoneBusy = false, listeningBusy = false, rfCaptureAction = '', rfCaptureTimer, rfCaptureBaselineStatus = '';
+let preferenceSaver, tuningQueue, activePage='dashboard', renderScheduled=false, renderCost=0, lastCommandMs=0, micRegistered=false;
+const rfHistory=new RfHistory(), waterfallCaches=new Map();
 const browserMicAvailable=()=>!!(window.isSecureContext&&navigator.mediaDevices?.getUserMedia&&window.AudioWorkletNode);
 const meterSpecs = [
   ['level.STRENGTH','SIGNAL',v=>v>=0?'S9'+(v>0?' +'+Math.round(v):''):'S'+Math.max(0,Math.min(9,Math.round((v+54)/6))),v=>(v+54)/114],
@@ -53,22 +55,34 @@ function command(action, fields={}, editKey) {
   const seq=String(++sequence), payload=new URLSearchParams({action,seq,generation:String(state.generation),...fields});
   return new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>{ pending.delete(seq); if(editKey&&edits.get(editKey)?.seq===seq) edits.delete(editKey); reject(new Error('No command acknowledgement; check the station connection')); },10000);
-    pending.set(seq,{resolve,reject,timer,editKey}); if(editKey) edits.set(editKey,{seq,revision:null,until:Date.now()+12000}); socket.send(payload.toString());
+    pending.set(seq,{resolve,reject,timer,editKey,sent:performance.now()}); if(editKey) edits.set(editKey,{seq,revision:null,until:Date.now()+12000}); socket.send(payload.toString());
   });
 }
 const preferenceIds=['connectionKind','endpoint','baud','stopBits','flow','poll','rfSpan','rfCat2Port','rfCat2Baud','rfWaterfallLevel'];
-function saveStationPreferencesSoon() {
-  preferenceIds.forEach(id=>dirty.add(id));
-  clearTimeout(preferenceSaveTimer);
-  preferenceSaveTimer=setTimeout(async()=>{
+function readStationPreferences() {
     const fields={kind:$('connectionKind').value,endpoint:$('endpoint').value};
     for(const key of ['baud','stopBits','flow','poll'])fields[key]=$(key).value;
     fields.rfSpan=$('rfSpan').value;fields.rfCat2Port=$('rfCat2Port').value.trim();fields.rfCat2Baud=$('rfCat2Baud').value;
     const levelText=$('rfWaterfallLevel').value.trim(),level=Number(levelText);
+    if(preferenceSaver?.versions.has('rfWaterfallLevel')&&(levelText===''||!Number.isFinite(level)||level < -30||level > 30||!Number.isInteger(level*2)))throw new Error('Waterfall level must be -30 to +30 dB in 0.5 dB steps');
     if(levelText!==''&&Number.isFinite(level)&&level>=-30&&level<=30&&Number.isInteger(level*2))fields.rfWaterfallLevel=level.toFixed(1);
-    try { await command('preferences',fields);preferenceIds.forEach(id=>dirty.delete(id)); }
-    catch(error) { notify('Could not save settings: '+(error.message||String(error))); }
-  },350);
+    return fields;
+}
+function saveStationPreferencesSoon(event) {
+  const key=event?.target?.id;if(!preferenceIds.includes(key))return;
+  dirty.add(key);preferenceSaver.edit(key);
+}
+function subscribeScopes() {
+  if(socket?.readyState===1)command('subscribe',{audio:activePage==='scope'&&!document.hidden?'1':'0',rf:['dashboard','rfScope'].includes(activePage)&&!document.hidden?'1':'0'}).catch(()=>{});
+}
+function scheduleScopes() {
+  if(renderScheduled||document.hidden)return;renderScheduled=true;
+  requestAnimationFrame(()=>{renderScheduled=false;const started=performance.now();drawScope();drawRfScope();renderCost=performance.now()-started;updateDiagnostics();});
+}
+function updateDiagnostics() {
+  if(!$('diagnosticText')||!state)return;
+  const rf=state.rfScope||{};
+  setText($('diagnosticText'),`CAT: ${state.connection.endpoint} · last reply ${state.contactAge>=0?(state.contactAge/1000).toFixed(1)+' s ago':'unavailable'}\nRF: ${rf.running?(rf.frameValid?'live':'waiting / stale'):'stopped'} · age ${rf.age>=0?rf.age+' ms':'unavailable'}\nBrowser: ${socket?.readyState===1?'connected':'disconnected'} · command acknowledgement ${lastCommandMs.toFixed(0)} ms\nAudio: ${audioContext?.state||'off'} · session ${navigator.audioSession?.type||'system default'} / ${navigator.audioSession?.state||'unknown'}\nDraw: ${renderCost.toFixed(1)} ms · ${state.audio.refreshing?'refreshing devices':state.audio.receiveText}\nMicrophone: ${microphone?'armed':'disarmed'} · ${state.releasePending?'PTT release retry pending':'PTT release clear'}`);
 }
 function setting(id) { return state?.settings?.find(item=>item.id===id); }
 function discreteLevel(item, maximum, normalized) {
@@ -105,7 +119,7 @@ function optionList(node, entries, selected) {
   const signature=JSON.stringify(entries); if(node.dataset.options!==signature) { const previous=node.value;node.replaceChildren(...entries.map(([label,value])=>{const option=element('option',label);option.value=value;return option;}));node.dataset.options=signature;if(document.activeElement===node||dirty.has(node.id))node.value=previous; }
   if(document.activeElement!==node && !dirty.has(node.id)) node.value=String(selected ?? '');
 }
-function showPage(name) { document.querySelectorAll('.page').forEach(node=>node.hidden=node.id!==name);document.querySelectorAll('[data-page]').forEach(node=>node.classList.toggle('selected',node.dataset.page===name));if(name==='scope') drawScope();if(name==='rfScope'||name==='dashboard') drawRfScope();const tab=document.querySelector(`[data-page="${name}"]`);if(tab&&window.matchMedia('(max-width: 650px)').matches)tab.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'});window.scrollTo(0,0); }
+function showPage(name) { activePage=name;if(name==='settings'&&state)renderSettings();document.querySelectorAll('.page').forEach(node=>node.hidden=node.id!==name);document.querySelectorAll('[data-page]').forEach(node=>node.classList.toggle('selected',node.dataset.page===name));subscribeScopes();scheduleScopes();const tab=document.querySelector(`[data-page="${name}"]`);if(tab&&window.matchMedia('(max-width: 650px)').matches)tab.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'});window.scrollTo(0,0); }
 function updateStickyNavigation(){const header=document.querySelector('.topbar'),notice=$('notice');if(!header||!notice)return;const headerHeight=Math.ceil(header.getBoundingClientRect().height),noticeHeight=notice.getBoundingClientRect().height;document.documentElement.style.setProperty('--topbar-height',headerHeight+'px');document.documentElement.style.setProperty('--section-tabs-top',headerHeight+noticeHeight+'px');}
 function frequency(hz) { return Math.round(hz).toString().padStart(8,'0').replace(/(\d+)(\d{3})(\d{3})$/,'$1.$2.$3'); }
 function parseFrequencyInput(input){let text=String(input).trim().toLowerCase().replace(/\s+/g,'');let multiplier=0;for(const [unit,scale]of [['mhz',1e6],['khz',1e3],['hz',1]])if(text.endsWith(unit)){text=text.slice(0,-unit.length);multiplier=scale;break;}const separators=(text.match(/[.,]/g)||[]).length;if(separators>1)text=text.replace(/[.,]/g,'');else text=text.replace(',','.');const match=text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))$/);if(!match)throw new Error('Enter a frequency such as 7.074 MHz, 7074 kHz, or 7074000 Hz');const value=Number(match[1]);if(!Number.isFinite(value))throw new Error('Enter a valid radio frequency');if(!multiplier)multiplier=value<=60?1e6:value<=60000?1e3:1;const hz=Math.round(value*multiplier);if(hz<30000||hz>60000000)throw new Error('Frequency must be between 0.030 and 60 MHz');return hz;}
@@ -125,17 +139,17 @@ function initializeCards() {
 }
 function render(next) {
   const previous=state;state=next;const live=state.online&&!state.busy, tx=state.pttKnown&&state.transmitting;
-  if(previous && previous.generation!==state.generation) { edits.clear();dirty.clear();stopClientAudio();scopeRows=[];scopeBins=null;scopePeaks=null;scopeGeneration=-1;rfRows=[];rfBins=null; }
+  if(previous && previous.generation!==state.generation) { edits.clear();for(const key of [...dirty])if(!preferenceSaver?.versions.has(key))dirty.delete(key);tuningQueue?.clear();stopClientAudio();scopeRows=[];scopeBins=null;scopePeaks=null;scopeGeneration=-1;rfHistory.clear();rfRows=[];rfBins=null; }
   const off=(state.poweredOff||state.standby)&&!state.busy,status=off?'Powered off':state.status;
   const error=off&&state.error?.startsWith('Frequency read:')?'':state.error;
   $('login').hidden=true;$('app').hidden=false;$('app').inert=false;$('mobilePttBar').hidden=false;setText($('connectionStatus'),status+(state.demo?' · DEMO':''));setText($('footerStatus'),error||(off?status:`${status} · ${state.pttKnown?(tx?'TX':'RX'):'TX status unknown'} · ${state.settings.length} driver settings`));
   if(off&&$('notice').textContent.startsWith('Frequency read:'))notify('');
   if(error && error!==previous?.error) notify(error);
   const owned=state.dashboardPtt||state.pttPending;
-  $('ptt').classList.toggle('active',owned);setText($('ptt'),owned?(state.pttPending&&!state.dashboardPtt?'Starting TX…':'PTT off'):tx?'External TX':'PTT on');$('ptt').disabled=!owned&&(!live||!state.canPtt||!state.pttKnown||tx);
+  $('ptt').classList.toggle('active',owned||state.releasePending);setText($('ptt'),state.releasePending?'Retrying PTT release…':owned?(state.pttPending&&!state.dashboardPtt?'Starting TX…':'PTT off'):tx?'External TX':'PTT on');$('ptt').disabled=!owned&&!state.releasePending&&(!live||!state.canPtt||!state.pttKnown||tx);
   const active=state.vfos[state.activeVfo==='B'?1:0], frequencyText=active.frequencyValid?frequency(active.frequency):'Frequency unavailable';
   setText($('mobileTxStatus'),!state.portOpen?'Connect to radio':state.busy?'Connecting to radio…':off?'Radio powered off':tx?'TRANSMITTING · tap PTT to unkey':`RX · ${frequencyText}`);
-  $('powerOn').disabled=!state.portOpen||state.busy||!state.canPower;$('powerOff').disabled=!live||!state.canPower;
+  $('powerOn').disabled=!state.portOpen||state.busy||!state.canPower||state.transmitting||state.releasePending;$('powerOff').disabled=!live||!state.canPower;
   const connection=state.connection;
   setText($('connectionSummary'),`${state.portOpen?(off?'Powered off':'Connected'):'Not connected'} · ${connection.endpoint||'Choose an endpoint'}`);
   value('connectionKind',connection.kind);for(const key of ['endpoint','baud','stopBits','flow','poll'])value(key,connection[key]);
@@ -161,22 +175,22 @@ function render(next) {
   setText($('gainVfo'),'RF power / meters: shared · Gains: '+state.settingsVfo);
   cycleElements.forEach(({name,button})=>{const current=cycleControlState(name);setText(button,current.label);button.disabled=!live||!current.enabled;button.classList.toggle('selected',current.selected);});
   functionSpecs.forEach(([id],index)=>{const item=setting(id),button=functionElements[index];button.disabled=!live||!item?.valid||!item.writable;button.classList.toggle('selected',!!item?.valid&&item.value!=='0');});
-  value('settingsVfo',state.settingsVfo);renderSettings();renderAudio();
+  value('settingsVfo',state.settingsVfo);if(activePage==='settings')renderSettings();renderAudio();
   const log=state.activity.join('\n'),pre=$('activityLog'),bottom=pre.scrollHeight-pre.scrollTop-pre.clientHeight<30;if(pre.textContent!==log){pre.textContent=log;if(bottom)pre.scrollTop=pre.scrollHeight;}
   $('catQuery').disabled=$('catWrite').disabled=!live||state.demo||connection.kind!==0;
   setText($('scopeStatus'),state.scope.generated?'DEMO / GENERATED AUDIO · no radio audio device is open':!state.online?'Connect the radio and enable Receive audio':tx?'Paused during TX · earlier waterfall history retained':state.scope.fresh?'Live receive audio · source: '+(state.audio.devices.find(device=>device.id===state.audio.maps[0])?.name||'radio receive'):'Waiting for receive samples · '+state.audio.receiveText);
   const rf=state.rfScope||{};
   const rfStatus=rf.status||'RF capture is off';if(previous?.rfScope&& !rf.running&&rfStatus!==previous.rfScope.status&&!/stopped|off/i.test(rfStatus))notify('RF capture: '+rfStatus);
   setText($('rfStatus'),rfStatus);updateRfCaptureButtons(rf);
-  if(rf.spanIndex>=0&&rf.spanIndex<=9&&!dirty.has('rfSpan')&&document.activeElement!==$('rfSpan'))$('rfSpan').value=String(rf.spanIndex);
+  if(rf.requestedSpanIndex>=0&&rf.requestedSpanIndex<=9&&!dirty.has('rfSpan')&&document.activeElement!==$('rfSpan'))$('rfSpan').value=String(rf.requestedSpanIndex);
   if(rf.cat2Port!==undefined&&!dirty.has('rfCat2Port')&&document.activeElement!==$('rfCat2Port'))$('rfCat2Port').value=rf.cat2Port;
   if(rf.cat2Baud!==undefined&&!dirty.has('rfCat2Baud')&&document.activeElement!==$('rfCat2Baud'))$('rfCat2Baud').value=rf.cat2Baud;
   if(rf.levelDb!==undefined&&!dirty.has('rfWaterfallLevel')&&document.activeElement!==$('rfWaterfallLevel'))$('rfWaterfallLevel').value=Number(rf.levelDb).toFixed(1);
-  $('rfApplySpan').disabled=false;drawRfScope();
+  $('rfApplySpan').disabled=!!rf.applying;setText($('rfApplyStatus'),rf.applyStatus||'');scheduleScopes();
   if(microphone&&(!state.online||!state.audio.microphoneWanted||state.audio.maps[2]!=='browser:capture'))stopMicrophone();
   audioNode?.port.postMessage({kind:'gate',enabled:!!(microphone&&tx&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
   audioNode?.port.postMessage({kind:'listen',enabled:listening&&!tx&&state.online&&state.pttKnown});
-  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;drawScope();
+  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;scheduleScopes();updateDiagnostics();
 }
 function renderSettings() {
   const query=$('settingFilter').value.toLowerCase(),alive=new Set();let count=0;
@@ -191,6 +205,7 @@ function openSetting(id) {
 }
 function renderAudio() {
   const a=state.audio;setText($('audioError'),a.error);
+  $('unattended').checked=!!a.unattended;
   setText($('hostReceiveState'),a.receiveWanted?'On':'Off');setText($('hostMicrophoneState'),a.microphoneWanted?'On':'Off');
   for(let slot=0;slot<4;slot++){const input=slot===0||slot===2,radio=slot===0||slot===3;const devices=a.devices.filter(device=>device.input===input&&(!radio||!device.remote));const entries=[['Choose a device',''],...devices.map(device=>[device.name,device.id])];if(a.maps[slot]&&!devices.some(device=>device.id===a.maps[slot]))entries.push(['Saved device unavailable / reconnect',a.maps[slot]]);optionList($('audioMap'+slot),entries,a.maps[slot]);}
   for(const [id,wanted,label]of [['receiveRoute',a.receiveWanted,'Receive audio'],['scopeReceive',a.receiveWanted,'Receive audio'],['microphoneRoute',a.microphoneWanted,'Microphone']]){setText($(id),label+': '+(wanted?'On':'Off'));$(id).classList.toggle('selected',wanted);$(id).disabled=!wanted&&(!state.online||state.demo||state.busy);}
@@ -203,22 +218,32 @@ function reconnect() {
   reconnectTimer=setTimeout(async()=>{try{const reply=await fetch('/api/state',{signal:AbortSignal.timeout(6000)});if(reply.status===401){$('login').hidden=false;$('app').hidden=true;return;}if(!reply.ok)throw new Error('Station unavailable');connectWeb();}catch{reconnectDelay=Math.min(10000,reconnectDelay*1.5);reconnect();}},reconnectDelay);
 }
 async function connectWeb() {
-  if(closing)return;clearTimeout(reconnectTimer);clearInterval(heartbeat);socket=new WebSocket(`wss://${location.host}/ws`);socket.binaryType='arraybuffer';
-  socket.onopen=()=>{reconnectDelay=2000;heartbeat=setInterval(()=>{if(socket.readyState===1)socket.send(new URLSearchParams({action:'heartbeat'}).toString());},2000);};
+  if(closing)return;clearTimeout(reconnectTimer);clearInterval(heartbeat);let receivedState=false;const connection=new WebSocket(`wss://${location.host}/ws`);socket=connection;socket.binaryType='arraybuffer';
+  socket.onopen=()=>{if(socket!==connection)return;reconnectDelay=2000;subscribeScopes();heartbeat=setInterval(()=>{if(connection.readyState===1)connection.send(new URLSearchParams({action:'heartbeat'}).toString());},2000);};
   socket.onmessage=event=>{
+    if(socket!==connection)return;
     if(typeof event.data!=='string'){binary(event.data);return;}
     const data=JSON.parse(event.data);
-    if(data.type==='hello'){client=data.client;return;}if(data.type==='state'){render(data);return;}
+    if(data.type==='delta'){if(!state)return;render(mergeState(state,data));return;}
+    if(data.type==='hello'){client=data.client;return;}if(data.type==='state'){render(data);if(!receivedState){receivedState=true;subscribeScopes();preferenceSaver?.flush();}return;}
     if(data.type==='error'){notify(data.error);return;}
-    if(data.type==='ack'){const waiting=pending.get(data.seq);if(!waiting)return;clearTimeout(waiting.timer);pending.delete(data.seq);const edit=edits.get(waiting.editKey);if(data.ok){if(edit?.seq===data.seq)edit.revision=data.revision||0;waiting.resolve(data);}else{if(edit?.seq===data.seq)edits.delete(waiting.editKey);waiting.reject(new Error(data.error));}}
+    if(data.type==='ack'){const waiting=pending.get(data.seq);if(!waiting)return;lastCommandMs=performance.now()-waiting.sent;clearTimeout(waiting.timer);pending.delete(data.seq);const edit=edits.get(waiting.editKey);if(data.ok){if(edit?.seq===data.seq)edit.revision=data.revision||0;waiting.resolve(data);}else{if(edit?.seq===data.seq)edits.delete(waiting.editKey);waiting.reject(new Error(data.error));}}
   };
-  socket.onclose=()=>{clearInterval(heartbeat);stopClientAudio();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}pending.clear();edits.clear();client=0;$('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;setText($('connectionStatus'),'Browser disconnected · readings paused');setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');if(!scopeFrozen){scopeBins=null;drawScope();}if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}};
+  socket.onclose=()=>{if(socket!==connection)return;clearInterval(heartbeat);tuningQueue?.clear();stopClientAudio();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}pending.clear();edits.clear();client=0;$('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;setText($('connectionStatus'),'Browser disconnected · readings paused');setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');if(!scopeFrozen){scopeBins=null;scheduleScopes();}if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}};
   socket.onerror=()=>{};
+}
+function audioSessionType(capturing=false) {
+  try { if(navigator.audioSession)navigator.audioSession.type=capturing||(listening&&$('stableAudio')?.checked)?'play-and-record':'playback'; }catch{}
+}
+function audioInterrupted(message) {
+  if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});
+  stopMicrophone();setText($('browserStatus'),message);$('resumeAudio').hidden=false;updateDiagnostics();
 }
 async function ensureAudio() {
   if(!window.AudioContext)throw new Error('This browser does not support Web Audio playback');
   if(!audioContext){audioContext=new AudioContext({latencyHint:'interactive',sampleRate:48000});const context=audioContext;const resumed=context.resume();audioSetup=(async()=>{await resumed;if(isSecureContext&&window.AudioWorkletNode&&context.audioWorklet){await context.audioWorklet.addModule('/audio-worklet.js');audioNode=new AudioWorkletNode(context,'station-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});audioNode.supportsMicrophone=true;}else audioNode=new StationPlayback(context);listeningGain=context.createGain();listeningGain.gain.value=Number($('browserVolume').value)/100;audioNode.connect(listeningGain).connect(context.destination);if(isSecureContext&&context.setSinkId&&$('browserOutput').value)await context.setSinkId($('browserOutput').value);audioNode.port.onmessage=({data})=>{if(data.kind==='mic'&&microphone&&socket?.readyState===1&&socket.bufferedAmount<8192)socket.send(data.buffer);if(data.kind==='peak')$('clientMicPeak').value=data.value;};})().catch(async error=>{await context.close().catch(()=>{});if(audioContext===context){audioContext=audioNode=listeningGain=audioSetup=null;}throw error;});}
   await audioSetup;
+  audioContext.onstatechange=()=>{updateDiagnostics();if(['interrupted','suspended','closed'].includes(audioContext.state)&&(microphone||microphoneBusy))audioInterrupted('Audio interrupted. Tap Resume audio, then arm the microphone again.');};
   await audioContext.resume();
 }
 async function ensureReceive() {
@@ -230,18 +255,18 @@ async function ensureReceive() {
 async function listen() {
   if(listeningBusy)return;listeningBusy=true;const epoch=audioEpoch;renderAudio();
   try{if(listening){listening=false;audioNode?.port.postMessage({kind:'listen',enabled:false});await command('listen',{enabled:'0'});setText($('browserStatus'),'Listening stopped.');}
-  else{await ensureAudio();await ensureReceive();await command('listen',{enabled:'1'});if(epoch!==audioEpoch||socket?.readyState!==1)throw new Error('Connection changed; enable listening again');listening=true;expectedAudio=undefined;audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
+  else{if($('stableAudio')?.checked){try{if(navigator.audioSession)navigator.audioSession.type='play-and-record';}catch{}}await ensureAudio();await ensureReceive();await command('listen',{enabled:'1'});if(epoch!==audioEpoch||socket?.readyState!==1)throw new Error('Connection changed; enable listening again');listening=true;expectedAudio=undefined;audioSessionType();audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
   finally{listeningBusy=false;renderAudio();}
 }
-function stopMicrophone() { ++audioEpoch;microphone=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;micStream?.getTracks().forEach(track=>track.stop());micStream=null;$('clientMicPeak').value=0;if(state)renderAudio(); }
+function stopMicrophone() { ++audioEpoch;microphone=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;micStream?.getTracks().forEach(track=>track.stop());micStream=null;if(micRegistered){micRegistered=false;command('browserMic',{enabled:'0'}).catch(()=>{});}audioSessionType();$('clientMicPeak').value=0;if(state)renderAudio(); }
 function stopClientAudio() { listening=false;stopMicrophone();audioNode?.port.postMessage({kind:'listen',enabled:false});audioNode?.port.postMessage({kind:'reset'});expectedAudio=undefined;setText($('browserStatus'),'Browser audio stopped.');if(state)renderAudio(); }
 async function armMicrophone() {
-  if(microphone){if(state.browserOwner===client)await command('ptt',{enabled:'0'});stopMicrophone();await command('audioRoute',{route:'microphone',enabled:'0'});setText($('browserStatus'),'Browser microphone disarmed.');return;}
+  if(microphone){if(state.browserOwner===client)await command('ptt',{enabled:'0'});stopMicrophone();setText($('browserStatus'),'Browser microphone disarmed.');return;}
   if(!browserMicAvailable())throw new Error('Microphone capture needs a supported browser and trusted HTTPS. Install and trust the station certificate, then open this page in Safari or another current browser.');
   if(!state.online||state.demo||!state.audio.maps[3])throw new Error('Connect the radio and choose its USB transmit playback device first');
   if(microphoneBusy)return;microphoneBusy=true;const epoch=audioEpoch,owner=client;renderAudio();
-  try{await ensureAudio();await command('audioMap',{slot:'2',device:'browser:capture'});await command('audioRoute',{route:'microphone',enabled:'1'});const device=$('browserInput').value;const stream=await navigator.mediaDevices.getUserMedia({audio:{...(device?{deviceId:{exact:device}}:{}),channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online){stream.getTracks().forEach(track=>track.stop());throw new Error('Connection changed; arm the microphone again');}micStream=stream;micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;audioNode.port.postMessage({kind:'gate',enabled:!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});setText($('browserStatus'),'Microphone armed. Tap PTT on to transmit, then PTT off.');browserDevices().catch(error=>notify(error.message));}
-  catch(error){stopMicrophone();if(owner===client)await command('audioRoute',{route:'microphone',enabled:'0'}).catch(()=>{});throw error;}
+  try{audioSessionType(true);await ensureAudio();const device=$('browserInput').value;const stream=await navigator.mediaDevices.getUserMedia({audio:{...(device?{deviceId:{exact:device}}:{}),channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});micStream=stream;if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');await command('audioMap',{slot:'2',device:'browser:capture'});await command('browserMic',{enabled:'1'});micRegistered=true;if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');for(const track of stream.getAudioTracks()){track.addEventListener('ended',()=>audioInterrupted('Microphone disconnected. Choose a device and arm it again.'),{once:true});track.addEventListener('mute',()=>audioInterrupted('Microphone interrupted. Tap Resume audio and arm it again.'),{once:true});}await audioContext.resume();micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;audioNode.port.postMessage({kind:'gate',enabled:!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});setText($('browserStatus'),'Microphone armed. Tap PTT on to transmit, then PTT off.');browserDevices().catch(error=>notify(error.message));}
+  catch(error){stopMicrophone();throw error;}
   finally{microphoneBusy=false;renderAudio();}
 }
 async function browserDevices() {
@@ -252,14 +277,26 @@ async function browserDevices() {
 function binary(buffer) {
   const header=new DataView(buffer);if(buffer.byteLength<8)return;const type=header.getUint32(0,true);
   if(type===1&&listening&&audioNode){const sequence=header.getUint32(4,true),pcm=new Int16Array(buffer,8),samples=new Float32Array(pcm.length);for(let i=0;i<pcm.length;i++)samples[i]=pcm[i]/32768;const reset=expectedAudio!==undefined&&expectedAudio!==sequence;expectedAudio=(sequence+pcm.length)>>>0;audioNode.port.postMessage({kind:'rx',samples,reset},[samples.buffer]);}
-  if(type===2&&buffer.byteLength===12+2049*4){const rate=header.getUint32(4,true),generation=header.getUint32(8,true);if(generation!==scopeGeneration){clearScope();scopeGeneration=generation;}scopeRate=rate;if(!scopeFrozen){const bins=new Float32Array(buffer,12).slice();if(scopeBins)for(let i=0;i<bins.length;i++)bins[i]=10*Math.log10(.55*Math.pow(10,scopeBins[i]/10)+.45*Math.pow(10,bins[i]/10));scopeBins=bins;const raw=new Float32Array(buffer,12).slice();if(scopePeakHold){if(!scopePeaks)scopePeaks=raw.slice();else for(let i=0;i<raw.length;i++)scopePeaks[i]=Math.max(scopePeaks[i],raw[i]);}scopeRows.unshift({bins:raw,time:performance.now()});if(scopeRows.length>300)scopeRows.pop();drawScope();}}
-  if(type===4&&buffer.byteLength===12+850){rfCenterHz=header.getUint32(4,true);rfSpanHz=header.getUint32(8,true);rfBins=new Uint8Array(buffer.slice(12));rfRows.unshift(rfBins.slice());if(rfRows.length>2048)rfRows.pop();drawRfScope();}
+  if(type===2&&buffer.byteLength===12+2049*4){const rate=header.getUint32(4,true),generation=header.getUint32(8,true);if(generation!==scopeGeneration){clearScope();scopeGeneration=generation;}scopeRate=rate;if(!scopeFrozen){const bins=new Float32Array(buffer,12).slice();if(scopeBins)for(let i=0;i<bins.length;i++)bins[i]=10*Math.log10(.55*Math.pow(10,scopeBins[i]/10)+.45*Math.pow(10,bins[i]/10));scopeBins=bins;const raw=new Float32Array(buffer,12).slice();if(scopePeakHold){if(!scopePeaks)scopePeaks=raw.slice();else for(let i=0;i<raw.length;i++)scopePeaks[i]=Math.max(scopePeaks[i],raw[i]);}scopeRows.unshift({bins:raw,time:performance.now()});if(scopeRows.length>300)scopeRows.pop();scheduleScopes();}}
+  if(type===4&&buffer.byteLength===20+850){const center=header.getUint32(4,true),span=header.getUint32(8,true),generation=header.getUint32(12,true),seq=header.getUint32(16,true),bins=new Uint8Array(buffer.slice(20));if(rfHistory.push(center,span,generation,seq,bins)){rfCenterHz=center;rfSpanHz=span;rfBins=bins;rfRows=rfHistory.rows;scheduleScopes();}}
 }
 let scopeRate=48000,scopeGeneration=-1,scopeBins=null,scopePeaks=null,scopeRows=[],scopeFrozen=false,scopePeakHold=false;
 let rfCenterHz=0,rfSpanHz=200000,rfBins=null,rfRows=[];
 const palette=[[8,16,29],[24,45,116],[24,128,189],[52,213,181],[255,202,83],[255,92,75]];
+const rfPalette=[[5,8,30],[27,25,108],[22,79,184],[0,170,216],[37,220,151],[236,231,74],[255,121,35],[255,246,220]];
+function lookupPalette(stops,size){const result=new Uint8ClampedArray(size*4);for(let i=0;i<size;i++){const p=i/(size-1)*(stops.length-1),index=Math.min(stops.length-2,Math.floor(p)),part=p-index;for(let c=0;c<3;c++)result[i*4+c]=Math.round(stops[index][c]+part*(stops[index+1][c]-stops[index][c]));result[i*4+3]=255;}return result;}
+const audioColors=lookupPalette(palette,1024),rfColors=lookupPalette(rfPalette,256);
+function waterfallImage(key,width,height,rows,signature,pixel){
+  let cache=waterfallCaches.get(key);const reset=!cache||cache.width!==width||cache.height!==height||cache.signature!==signature;
+  if(reset){const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;cache={canvas,context:canvas.getContext('2d'),width,height,signature};waterfallCaches.set(key,cache);}
+  if(!reset&&cache.last===rows[0])return cache.canvas;
+  let added=reset?height:rows.indexOf(cache.last);if(added<0)added=height;added=Math.min(height,added);
+  if(added<height&&added>0)cache.context.drawImage(cache.canvas,0,0,width,height-added,0,added,width,height-added);
+  if(added>0){const pixels=cache.context.createImageData(width,added);for(let y=0;y<added;y++)for(let x=0;x<width;x++)pixel(rows[y],x,width,pixels.data,(y*width+x)*4);cache.context.putImageData(pixels,0,0);}
+  cache.last=rows[0];return cache.canvas;
+}
 function color(fraction){const scale=Math.max(0,Math.min(1,fraction))*5,index=Math.min(4,Math.floor(scale)),part=scale-index;return palette[index].map((channel,i)=>Math.round(channel+part*(palette[index+1][i]-channel)));}
-function clearScope(){scopeBins=null;scopePeaks=null;scopeRows=[];drawScope();}
+function clearScope(){scopeBins=null;scopePeaks=null;scopeRows=[];scheduleScopes();}
 function canvasContext(id){const canvas=$(id),ratio=devicePixelRatio||1,width=canvas.clientWidth,height=canvas.clientHeight;if(!width||!height)return null;if(canvas.width!==Math.round(width*ratio)||canvas.height!==Math.round(height*ratio)){canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);}const context=canvas.getContext('2d');context.setTransform(ratio,0,0,ratio,0,0);return {context,width,height};}
 function drawScope(){
   if($('scope').hidden)return;const top=canvasContext('spectrumCanvas'),bottom=canvasContext('waterfallCanvas');if(!top||!bottom)return;
@@ -270,9 +307,8 @@ function drawScope(){
   const spectrum=prepare(top);axes(spectrum,true);
   function trace(bins,stroke,width){if(!bins)return;const {c,x,y,w,h}=spectrum;c.strokeStyle=stroke;c.lineWidth=width;c.beginPath();for(let i=0;i<Math.floor(w);i++){const db=column(bins,i,w),level=Math.max(0,Math.min(1,(db+gain-floor)/-floor)),pos=y+h*(1-level);if(i)c.lineTo(x+i,pos);else c.moveTo(x+i,pos);}c.stroke();}
   if(scopeBins){if(scopePeakHold)trace(scopePeaks,'#ffc165',1);trace(scopeBins,'#50d3c2',2);let strongest=1;for(let i=2;i<=Math.min(2048,Math.floor(maxBin));i++)if(scopeBins[i]>scopeBins[strongest])strongest=i;setText($('spectrumDetail'),`Peak ${Math.round(strongest*scopeRate/4096)} Hz · ${scopeBins[strongest].toFixed(1)} dBFS · ${(scopeRate/4096).toFixed(1)} Hz / bin`);}else{spectrum.c.textAlign='center';spectrum.c.fillStyle='#8da2b8';spectrum.c.fillText('Waiting for receive samples',spectrum.x+spectrum.w/2,spectrum.y+spectrum.h/2);setText($('spectrumDetail'),'4096-point Hann FFT');}
-  const waterfall=prepare(bottom),image=document.createElement('canvas');image.width=512;image.height=300;const imageContext=image.getContext('2d'),pixels=imageContext.createImageData(512,300);
-  for(let row=0;row<300;row++)for(let x=0;x<512;x++){const rgb=scopeRows[row]?color((column(scopeRows[row].bins,x,512)+gain-floor)/-floor):palette[0],offset=(row*512+x)*4;pixels.data[offset]=rgb[0];pixels.data[offset+1]=rgb[1];pixels.data[offset+2]=rgb[2];pixels.data[offset+3]=255;}
-  imageContext.putImageData(pixels,0,0);waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,waterfall.h);
+  const waterfall=prepare(bottom),image=waterfallImage('audio',512,300,scopeRows,[span,gain,floor,scopeGeneration].join('/'),(row,x,width,data,offset)=>{const index=row?Math.max(0,Math.min(1023,Math.round((column(row.bins,x,width)+gain-floor)/-floor*1023))):0;data.set(audioColors.subarray(index*4,index*4+4),offset);});
+  waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,waterfall.h);
   const gradient=waterfall.c.createLinearGradient(0,waterfall.y,0,waterfall.y+waterfall.h);palette.forEach((rgb,i)=>gradient.addColorStop(1-i/5,`rgb(${rgb.join(',')})`));waterfall.c.fillStyle=gradient;waterfall.c.fillRect(waterfall.x-12,waterfall.y,6,waterfall.h);waterfall.c.fillStyle='#8da2b8';waterfall.c.textAlign='right';waterfall.c.fillText(String(-gain),waterfall.x-16,waterfall.y+10);waterfall.c.fillText(String(floor-gain),waterfall.x-16,waterfall.y+waterfall.h);
   axes(waterfall,false);const seconds=scopeRows.length?(scopeRows[0].time-scopeRows.at(-1).time)/1000:0;setText($('waterfallDetail'),`${scopeFrozen?'Frozen':'Newest at top'} · ${scopeRows.length} frames · ${seconds.toFixed(1)} s between first / last`);
 }
@@ -297,14 +333,10 @@ function drawRfWaterfallCanvas(canvasId,detailId,compact=false){
   const center=rfCenterHz||state?.rfScope?.centerHz||state?.vfos?.[state.activeVfo==='B'?1:0]?.frequency||0,span=rfSpanHz||200000;
   const {context:c,width,height}=item;c.fillStyle='#08101d';c.fillRect(0,0,width,height);c.font='11px system-ui';const waterfall={c,x:54,y:8,w:width-70,h:height-35};
   const pixelRatio=devicePixelRatio||1,rows=Math.min(rfRows.length,Math.ceil(waterfall.h*pixelRatio));
-  if(rows){const image=document.createElement('canvas');image.width=850;image.height=rows;const ic=image.getContext('2d'),pixels=ic.createImageData(850,rows),rfPalette=[[5,8,30],[27,25,108],[22,79,184],[0,170,216],[37,220,151],[236,231,74],[255,121,35],[255,246,220]];
-    function rfColor(fraction){const position=Math.max(0,Math.min(1,fraction))*(rfPalette.length-1),index=Math.min(rfPalette.length-2,Math.floor(position)),part=position-index;return rfPalette[index].map((channel,i)=>Math.round(channel+(rfPalette[index+1][i]-channel)*part));}
-    for(let row=0;row<rows;row++)for(let x=0;x<850;x++){const rgb=rfColor(rfRows[row][x]/255),offset=(row*850+x)*4;pixels.data[offset]=rgb[0];pixels.data[offset+1]=rgb[1];pixels.data[offset+2]=rgb[2];pixels.data[offset+3]=255;}
-    ic.putImageData(pixels,0,0);waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,rows/pixelRatio);
-  }
+  if(rows){const image=waterfallImage(canvasId,850,Math.ceil(waterfall.h*pixelRatio),rfRows,[rfCenterHz,rfSpanHz,rfHistory.generation].join('/'),(row,x,width,data,offset)=>{const value=row?row[x]:0;for(let c=0;c<4;c++)data[offset+c]=rfColors[value*4+c];});waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,waterfall.h);}
   const divisions=compact?2:4;c.fillStyle='#8da2b8';c.strokeStyle='#1f3040';c.lineWidth=1;
   for(let i=0;i<=divisions;i++){const px=waterfall.x+waterfall.w*i/divisions;c.beginPath();c.moveTo(px,waterfall.y);c.lineTo(px,waterfall.y+waterfall.h);c.stroke();c.textAlign=i===0?'left':i===divisions?'right':'center';const hz=center?center-span/2+span*i/divisions:0;c.fillText(center?frequency(hz):`${Math.round((i/divisions-.5)*span/1000)} kHz`,px,waterfall.y+waterfall.h+20);}
-  setText($(detailId),rfRows.length?(compact?`${Math.min(rfRows.length,rows)} rows · newest at top`:`${rfRows.length} frames · newest at top; older rows scroll off the bottom`):(compact?'Waiting for RF frames':'No RF frames received'));
+  const fresh=state?.rfScope?.frameValid&&rfHistory.fresh();setText($(detailId),rfRows.length?(fresh?(compact?`${Math.min(rfRows.length,rows)} rows · newest at top`:`${rfRows.length} frames · newest at top`):'Frozen history · waiting for fresh RF frames'):(compact?'Waiting for RF frames':'No RF frames received'));
 }
 function drawRfScope(){
   drawMobileRfPreview();if(!$('rfScope')||$('rfScope').hidden)return;
@@ -312,7 +344,7 @@ function drawRfScope(){
   drawRfWaterfallCanvas('rfWaterfallCanvas','rfWaterfallDetail');
 }
 function tuneRfFromCanvas(event,id){
-  if(!state?.online||state.busy||!rfBins)return;
+  if(!state?.online||state.busy||!rfBins||!state.rfScope?.frameValid||!rfHistory.fresh())throw new Error('Wait for a fresh RF scope frame before tuning');
   const canvas=$(id),rect=canvas.getBoundingClientRect(),plotLeft=54,plotWidth=Math.max(1,rect.width-70);
   const fraction=Math.max(0,Math.min(1,(event.clientX-rect.left-plotLeft)/plotWidth));
   const activeVfo=state.activeVfo==='B'?1:0,center=rfCenterHz||state.rfScope?.centerHz||state.vfos[activeVfo]?.frequency||0;
@@ -321,8 +353,15 @@ function tuneRfFromCanvas(event,id){
   $('controlVfo').value=state.activeVfo;dirty.delete('frequency');
   return command('frequency',{vfo:state.activeVfo,hz:String(Math.round(target))},'frequency');
 }
+function installPageLifecycle(){
+  window.addEventListener('resize',scheduleScopes);
+  window.addEventListener('pagehide',()=>{closing=true;clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
+  window.addEventListener('pageshow',event=>{if(event.persisted){closing=false;connectWeb();setText($('browserStatus'),'Page restored. Enable listening and arm the microphone again.');}});
+}
 async function exportCsv(){if(!state)return;const cell=value=>'"'+String(value??'').replace(/"/g,'""')+'"',utc=new Date().toISOString();const rows=[['Name','Group','Hamlib ID','Value','Raw value','Access','Range','Status','VFO','UTC']];state.vfos.forEach((vfo,index)=>{const name=index?'B':'A';for(const [field,label,valid,reading]of [['frequency','frequency (Hz)',vfo.frequencyValid,String(vfo.frequency)],['mode','mode / width',vfo.modeValid,vfo.mode+' / '+vfo.width]])rows.push(['VFO '+name+' '+label,'Radio / VFO','VFO'+name+'.'+field,valid?reading:'',valid?reading:'','Read / write','',valid?'Live':'Unavailable',name,utc]);});for(const item of state.settings)rows.push([item.name,item.group,item.id,item.valid?item.display:'',item.valid?item.value:'',item.writable?'Read / write':'Read only',item.range,item.status,state.settingsVfo,utc]);const blob=new Blob(['\ufeff'+rows.map(row=>row.map(cell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=element('a');link.href=url;link.download='FT710-settings.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function setup(){
+  preferenceSaver=new PreferenceSaver(readStationPreferences,fields=>command('preferences',fields),key=>dirty.delete(key),(text,failed)=>{setText($('preferenceStatus'),text);$('retryPreferences').hidden=!failed;});
+  $('retryPreferences').addEventListener('click',()=>preferenceSaver.flush());
   const phoneLayout=window.matchMedia('(max-width: 650px)');
   if(phoneLayout.matches){$('connectionPanel').open=false;$('hostReceiveRoute').open=false;$('hostMicrophoneRoute').open=false;$('rfControlPanel').open=false;}
   phoneLayout.addEventListener?.('change',event=>{if(!event.matches){$('connectionPanel').open=true;$('hostReceiveRoute').open=true;$('hostMicrophoneRoute').open=true;$('rfControlPanel').open=true;}});
@@ -337,7 +376,7 @@ function setup(){
   document.querySelectorAll('[data-vfo]').forEach(node=>node.addEventListener('click',protect(()=>{$('controlVfo').value=node.dataset.vfo;dirty.delete('frequency');dirty.delete('width');return command('vfo',{vfo:node.dataset.vfo},'controlVfo');})));
   $('loginForm').addEventListener('submit',protect(async event=>{event.preventDefault();const reply=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code:$('accessCode').value})});const data=await reply.json();if(!reply.ok){$('loginError').textContent=data.error;return;}$('accessCode').value='';closing=false;connectWeb();}));
   $('connectionForm').addEventListener('submit',protect(event=>{event.preventDefault();clearTimeout(preferenceSaveTimer);if(state.portOpen)return command('disconnect');const fields={kind:$('connectionKind').value};for(const key of ['endpoint','baud','stopBits','flow','poll'])fields[key]=$(key).value;for(const key of ['connectionKind','endpoint','baud','stopBits','flow','poll'])dirty.delete(key);return command('connect',fields);}));
-  $('connectionKind').addEventListener('change',()=>{if($('connectionKind').value==='1'&&!$('endpoint').value.includes(':'))$('endpoint').value='127.0.0.1:4532';if($('connectionKind').value==='0'&&$('endpoint').value.includes(':'))$('endpoint').value='COM3';});
+  $('connectionKind').addEventListener('change',()=>{const before=$('endpoint').value;if($('connectionKind').value==='1'&&!before.includes(':'))$('endpoint').value='127.0.0.1:4532';if($('connectionKind').value==='0'&&before.includes(':'))$('endpoint').value='COM3';if(before!==$('endpoint').value){dirty.add('endpoint');preferenceSaver.edit('endpoint');}});
   $('saveSharing').addEventListener('click',protect(async()=>{await command('sharing',{enabled:$('shareEnabled').checked?'1':'0',port:$('sharePort').value});dirty.delete('shareEnabled');dirty.delete('sharePort');}));
   $('ptt').addEventListener('click',protect(()=>command('ptt',{enabled:state.dashboardPtt||state.pttPending?'0':'1'})));
   $('frequencyForm').addEventListener('submit',protect(event=>{event.preventDefault();return command('frequency',{vfo:$('controlVfo').value,hz:String(parseFrequencyInput($('frequency').value))},'frequency');}));
@@ -346,8 +385,9 @@ function setup(){
   $('controlVfo').addEventListener('change',protect(()=>{dirty.delete('frequency');dirty.delete('width');return command('vfo',{vfo:$('controlVfo').value},'controlVfo');}));
   const tune=(steps,target=$('controlVfo').value)=>{if(!state?.online||state.busy||!steps)return;dirty.delete('frequency');return command('step',{vfo:target,hz:String(steps*Number($('step').value))},'frequency');};
   $('up').addEventListener('click',protect(()=>tune(1)));$('down').addEventListener('click',protect(()=>tune(-1)));
-  let drag,lastX,motion=0,tuneTimer;const steps=new Map(),queue=(delta,target=$('controlVfo').value)=>{steps.set(target,Math.max(-10,Math.min(10,(steps.get(target)||0)+delta)));clearTimeout(tuneTimer);tuneTimer=setTimeout(protect(async()=>{const batches=[...steps];steps.clear();for(const [vfo,count]of batches)await tune(count,vfo);}),90);};
-  $('dial').addEventListener('pointerdown',event=>{if(!state?.online)return;drag=event.pointerId;lastX=event.clientX;motion=0;$('dial').setPointerCapture(drag);});$('dial').addEventListener('pointermove',event=>{if(drag!==event.pointerId)return;motion+=event.clientX-lastX;lastX=event.clientX;const count=Math.trunc(motion/12);if(count){motion-=count*12;queue(count);}});for(const name of ['pointerup','pointercancel','lostpointercapture'])$('dial').addEventListener(name,()=>drag=undefined);
+  tuningQueue=new TuningQueue(async(vfo,hz)=>{if(!state?.online||state.busy)return;dirty.delete('frequency');await command('step',{vfo,hz:String(hz)},'frequency');},90,error=>notify(error.message));
+  let drag,lastX,motion=0;const queue=(delta,target=$('controlVfo').value)=>tuningQueue.add(target,delta*Number($('step').value));
+  $('dial').addEventListener('pointerdown',event=>{if(!state?.online)return;drag=event.pointerId;lastX=event.clientX;motion=0;$('dial').setPointerCapture(drag);});$('dial').addEventListener('pointermove',event=>{if(drag!==event.pointerId)return;motion+=event.clientX-lastX;lastX=event.clientX;const count=Math.trunc(motion/12);if(count){motion-=count*12;queue(count);}});for(const name of ['pointerup','pointercancel','lostpointercapture'])$('dial').addEventListener(name,()=>{drag=undefined;tuningQueue.flush().catch(error=>notify(error.message));});
   $('dial').addEventListener('keydown',protect(event=>{if(['ArrowLeft','ArrowDown','ArrowRight','ArrowUp','PageUp','PageDown'].includes(event.key)){event.preventDefault();return tune(event.key==='PageUp'?10:event.key==='PageDown'?-10:event.key==='ArrowLeft'||event.key==='ArrowDown'?-1:1);}}));
   for(const id of ['dial','freqA','freqB'])$(id).addEventListener('wheel',event=>{event.preventDefault();queue(event.deltaY<0?1:-1,id==='dial'?$('controlVfo').value:id==='freqB'?'B':'A');},{passive:false});
   $('settingFilter').addEventListener('input',()=>state&&renderSettings());$('settingsVfo').addEventListener('change',protect(async()=>{await command('settingsVfo',{vfo:$('settingsVfo').value});dirty.delete('settingsVfo');}));
@@ -366,17 +406,24 @@ function setup(){
   $('browserInput').addEventListener('change',()=>{localStorage.setItem('browserInput',$('browserInput').value);if(microphone||microphoneBusy){stopMicrophone();notify('Microphone selection changed. Arm the browser microphone again.',false);if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});}});
   $('browserOutput').addEventListener('change',protect(async()=>{await ensureAudio();if(!audioContext.setSinkId)throw new Error('This browser uses the system output');await audioContext.setSinkId($('browserOutput').value);localStorage.setItem('browserOutput',$('browserOutput').value);}));$('browserVolume').addEventListener('input',()=>{localStorage.setItem('browserVolume',$('browserVolume').value);if(listeningGain)listeningGain.gain.value=Number($('browserVolume').value)/100;});
   for(const id of ['scopeSpan','scopeGain','scopeFloor']){const saved=localStorage.getItem(id);if([...$(id).options].some(option=>option.value===saved))$(id).value=saved;$(id).addEventListener('change',()=>{localStorage.setItem(id,$(id).value);drawScope();});}
-  for(const id of ['rfSpan','rfCat2Port','rfCat2Baud']){let saved=localStorage.getItem(id);if(id==='rfCat2Baud'&&saved==='38400'){saved='4800';localStorage.setItem(id,saved);}if(saved&&([...$(id).options].some(option=>option.value===saved)||id==='rfCat2Port'))$(id).value=saved;$(id).addEventListener('change',()=>{localStorage.setItem(id,$(id).value);if(id==='rfSpan')dirty.delete(id);drawRfScope();});}
+  // Station preferences come from the server; localStorage holds local display/audio choices only.
   const savedRfLevel=localStorage.getItem('rfWaterfallLevel');if(savedRfLevel!==null&&Number.isFinite(Number(savedRfLevel))&&Number(savedRfLevel)>=-30&&Number(savedRfLevel)<=30&&Number.isInteger(Number(savedRfLevel)*2))$('rfWaterfallLevel').value=Number(savedRfLevel).toFixed(1);
   $('rfWaterfallLevel').addEventListener('change',()=>localStorage.setItem('rfWaterfallLevel',Number($('rfWaterfallLevel').value).toFixed(1)));
   for(const id of ['rfCapture','mobileRfCapture'])$(id).addEventListener('click',protect(toggleRfCapture));
   $('rfApplySpan').addEventListener('click',protect(async()=>{const port=$('rfCat2Port').value.trim(),level=Number($('rfWaterfallLevel').value);if(!/^COM\d+$/i.test(port))throw new Error('Enter the radio Standard / CAT-2 COM port, for example COM5');if(!Number.isFinite(level)||level < -30||level > 30||!Number.isInteger(level*2))throw new Error('Waterfall level must be -30 to +30 dB in 0.5 dB steps');await command('rfSpan',{port,baud:$('rfCat2Baud').value,span:$('rfSpan').value,level:level.toFixed(1)});dirty.delete('rfSpan');dirty.delete('rfWaterfallLevel');localStorage.setItem('rfWaterfallLevel',level.toFixed(1));notify('Radio confirmed CENTER mode, RF span, and waterfall level.',false);}));
-  $('rfClear').addEventListener('click',()=>{rfRows=[];rfBins=null;drawRfScope();});
+  $('rfClear').addEventListener('click',()=>{rfHistory.clear();rfRows=[];rfBins=null;waterfallCaches.clear();scheduleScopes();});
   for(const id of ['rfSpectrumCanvas','rfWaterfallCanvas','mobileRfSpectrumCanvas','mobileRfWaterfallCanvas'])$(id).addEventListener('click',protect(event=>tuneRfFromCanvas(event,id)));
   const savedStep=localStorage.getItem('step');if([...$('step').options].some(option=>option.value===savedStep))$('step').value=savedStep;$('step').addEventListener('change',()=>localStorage.setItem('step',$('step').value));
   $('scopeFreeze').addEventListener('click',()=>{scopeFrozen=!scopeFrozen;setText($('scopeFreeze'),scopeFrozen?'Resume':'Freeze');$('scopeFreeze').classList.toggle('selected',scopeFrozen);drawScope();});$('scopePeak').addEventListener('click',()=>{scopePeakHold=!scopePeakHold;scopePeaks=null;setText($('scopePeak'),'Peak hold: '+(scopePeakHold?'On':'Off'));$('scopePeak').classList.toggle('selected',scopePeakHold);drawScope();});$('scopeClear').addEventListener('click',clearScope);
   $('logout').addEventListener('click',protect(async()=>{if(state?.browserOwner===client)await command('ptt',{enabled:'0'});closing=true;clearTimeout(reconnectTimer);socket?.close();stopClientAudio();await fetch('/api/logout',{method:'POST'});$('app').hidden=true;$('mobilePttBar').hidden=true;$('login').hidden=false;}));
-  window.addEventListener('resize',()=>{drawScope();drawRfScope();});window.addEventListener('pagehide',()=>{closing=true;stopClientAudio();socket?.close();});
+  const stable=localStorage.getItem('stableAudio');$('stableAudio').checked=stable!=='0';$('stableAudio').disabled=!navigator.audioSession;
+  $('stableAudio').addEventListener('change',()=>{localStorage.setItem('stableAudio',$('stableAudio').checked?'1':'0');audioSessionType(microphone);});
+  $('resumeAudio').addEventListener('click',protect(async()=>{await ensureAudio();$('resumeAudio').hidden=true;setText($('browserStatus'),'Audio resumed. Arm the microphone again to transmit.');}));
+  $('unattended').addEventListener('change',protect(()=>command('unattended',{enabled:$('unattended').checked?'1':'0'})));
+  navigator.mediaDevices?.addEventListener?.('devicechange',()=>{browserDevices().catch(()=>{});updateDiagnostics();});
+  navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.');});
+  document.addEventListener('visibilitychange',()=>{subscribeScopes();if(document.hidden&&(microphone||microphoneBusy))audioInterrupted('Microphone disarmed while the page was hidden. Arm it again to transmit.');else scheduleScopes();});
+  installPageLifecycle();
   setInterval(()=>setText($('clock'),new Date().toISOString().slice(11,19)+' UTC'),1000);
   const code=new URLSearchParams(location.hash.slice(1)).get('code');if(code){$('accessCode').value=code;history.replaceState(null,'',location.pathname);}
   fetch('/api/state').then(reply=>{if(reply.ok){closing=false;connectWeb();}}).catch(()=>{});

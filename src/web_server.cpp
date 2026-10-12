@@ -1,5 +1,6 @@
 #include "web_server.hpp"
 #include "browser_audio.hpp"
+#include "web_delta.hpp"
 #include <ws2tcpip.h>
 #include <algorithm>
 #include <array>
@@ -99,7 +100,7 @@ std::map<std::string, std::string> form(const std::string& text) {
 }
 Server::Server(Handler handler, Log log) : handler_(std::move(handler)), log_(std::move(log)) {}
 Server::~Server() { stop(); }
-void Server::start(const std::wstring& certificateFolder, const std::string& accessCode) {
+void Server::start(const std::wstring& certificateFolder, const std::string& accessCode, bool loopbackOnly) {
     stop(); setAccessCode(accessCode);
     WSADATA data{}; if (WSAStartup(MAKEWORD(2,2), &data)) throw std::runtime_error("Could not initialize web networking"); winsock_ = true;
     try {
@@ -113,8 +114,11 @@ void Server::start(const std::wstring& certificateFolder, const std::string& acc
             if (listener_ == INVALID_SOCKET) throw std::runtime_error("Cannot create web socket (Winsock " + std::to_string(WSAGetLastError()) + ")");
         }
         setsockopt(listener_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char*>(&exclusive), sizeof exclusive);
-        sockaddr_in6 address6{}; address6.sin6_family = AF_INET6; address6.sin6_addr = in6addr_any; address6.sin6_port = htons(8888);
-        sockaddr_in address4{}; address4.sin_family = AF_INET; address4.sin_addr.s_addr = htonl(INADDR_ANY); address4.sin_port = htons(8888);
+        sockaddr_in6 address6{}; address6.sin6_family = AF_INET6; address6.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any; address6.sin6_port = htons(8888);
+        sockaddr_in address4{}; address4.sin_family = AF_INET; address4.sin_addr.s_addr = htonl(loopbackOnly ? INADDR_LOOPBACK : INADDR_ANY); address4.sin_port = htons(8888);
+        if (loopbackOnly && dualStack) address6.sin6_addr = in6addr_any;
+        // An IPv4 loopback socket avoids dual-stack wildcard exposure in fixtures.
+        if (loopbackOnly && dualStack) { closesocket(listener_);listener_=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);dualStack=false;setsockopt(listener_,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<char*>(&exclusive),sizeof exclusive); }
         auto* address = dualStack ? reinterpret_cast<sockaddr*>(&address6) : reinterpret_cast<sockaddr*>(&address4);
         if (bind(listener_, address, dualStack ? sizeof address6 : sizeof address4) || listen(listener_, 32)) throw std::runtime_error("Cannot listen on port 8888 (Winsock " + std::to_string(WSAGetLastError()) + "). Another dashboard/server may be using it.");
         running_ = true; acceptThread_ = std::thread([this] { acceptLoop(); });
@@ -152,11 +156,12 @@ void Server::spectrum(const audio::SpectrumFrame& frameData) {
 void Server::rfSpectrum(const rf_scope::Frame& frameData, std::uint64_t centerHz, std::uint32_t spanHz) {
     std::lock_guard lock(stateMutex_);
     if (!frameData.valid || !centerHz || !spanHz) { rfSpectrum_.clear(); rfSpectrumTick_ = 0; ++rfSpectrumRevision_; return; }
-    std::string payload; payload.reserve(12 + frameData.bins.size());
+    std::string payload; payload.reserve(20 + frameData.bins.size());
     auto append32 = [&](std::uint32_t value) {
         for (unsigned shift = 0; shift < 32; shift += 8) payload.push_back(static_cast<char>(value >> shift));
     };
     append32(4); append32(static_cast<std::uint32_t>(centerHz)); append32(spanHz);
+    append32(static_cast<std::uint32_t>(frameData.generation)); append32(static_cast<std::uint32_t>(frameData.sequence));
     payload.append(reinterpret_cast<const char*>(frameData.bins.data()), frameData.bins.size());
     rfSpectrum_ = std::move(payload); rfSpectrumTick_ = GetTickCount64(); ++rfSpectrumRevision_;
 }
@@ -252,6 +257,7 @@ void Server::serve(Client& client) {
         else if (method == "GET" && path == "/app.js") stream.send(response(200,"application/javascript; charset=utf-8",resource(203)));
         else if (method == "GET" && path == "/audio-worklet.js") stream.send(response(200,"application/javascript; charset=utf-8",resource(204)));
         else if (method == "GET" && path == "/audio-playback.js") stream.send(response(200,"application/javascript; charset=utf-8",resource(205)));
+        else if (method == "GET" && path == "/control-core.js") stream.send(response(200,"application/javascript; charset=utf-8",resource(207)));
         else stream.send(response(404,"application/json","{\"error\":\"Not found or request not allowed\"}"));
         }
     } catch (...) { /* Malformed/unauthenticated peers never reach radio control. */ }
@@ -267,8 +273,9 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
     std::vector<std::pair<std::string,std::future<std::string>>> pending;
     std::uint64_t revision = ~0ULL, urgentRevision = 0, spectrumRevision = 0, rfSpectrumRevision = 0, cursor = 0, epoch = 0;
     const auto accessRevision = accessRevision_.load();
-    bool listening = false, alive = true; auto seen = GetTickCount64(), sentState = seen, sentSpectrum = seen, sentRfSpectrum = seen;
+    bool listening = false, audioScope = false, rfScope = false, alive = true; auto seen = GetTickCount64(), sentState = seen, sentSpectrum = seen, sentRfSpectrum = seen;
     unsigned commands = 0; auto commandPeriod = seen;
+    std::string previousState;
     frame(stream,1,"{\"type\":\"hello\",\"client\":" + std::to_string(client.id) + ",\"rate\":48000}");
     while (alive && running_) {
         auto now = GetTickCount64();
@@ -300,10 +307,14 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
                 if (action == "heartbeat") continue;
                 if (now - commandPeriod >= 1000) { commandPeriod = now; commands = 0; }
                 if (++commands > 40 || pending.size() >= 16) throw std::runtime_error("Too many pending commands");
+                if (action == "subscribe") { audioScope = fields["audio"] == "1"; rfScope = fields["rf"] == "1"; spectrumRevision = rfSpectrumRevision = ~0ULL; frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
                 if (action == "listen") { listening = fields["enabled"] == "1"; cursor = 0; epoch = ~0ULL; frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
                 auto request = std::make_shared<Request>(); request->client = client.id; request->accessRevision = accessRevision; request->fields = std::move(fields);
                 pending.emplace_back(seq,request->reply.get_future()); handler_(std::move(request));
-            } catch (const std::exception& error) { frame(stream,1,"{\"type\":\"error\",\"error\":" + json(error.what()) + "}"); }
+            } catch (const std::exception& error) {
+                std::string seq; try { seq = form(payload)["seq"]; } catch (...) {}
+                frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":false,\"error\":" + json(error.what()) + "}");
+            }
         }
         for (auto it = pending.begin(); it != pending.end();) {
             if (it->second.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
@@ -316,10 +327,10 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
             if (revision != revision_ && (now - sentState >= 200 || urgentRevision < urgentRevision_)) {
                 state = state_; revision = revision_; urgentRevision = urgentRevision_; sentState = now;
             }
-            if (spectrumRevision != spectrumRevision_ && now - sentSpectrum >= 90) { if (spectrumTick_ && now - spectrumTick_ < 500) spectrum = spectrum_; spectrumRevision = spectrumRevision_; sentSpectrum = now; }
-            if (rfSpectrumRevision != rfSpectrumRevision_ && now - sentRfSpectrum >= 90) { if (rfSpectrumTick_ && now - rfSpectrumTick_ < 500) rfSpectrum = rfSpectrum_; rfSpectrumRevision = rfSpectrumRevision_; sentRfSpectrum = now; }
+            if (audioScope && spectrumRevision != spectrumRevision_ && now - sentSpectrum >= 90) { if (spectrumTick_ && now - spectrumTick_ < 500) spectrum = spectrum_; spectrumRevision = spectrumRevision_; sentSpectrum = now; }
+            if (rfScope && rfSpectrumRevision != rfSpectrumRevision_ && now - sentRfSpectrum >= 90) { if (rfSpectrumTick_ && now - rfSpectrumTick_ < 500) rfSpectrum = rfSpectrum_; rfSpectrumRevision = rfSpectrumRevision_; sentRfSpectrum = now; }
         }
-        if (!state.empty() && !frame(stream,1,state)) alive = false;
+        if (!state.empty()) { const auto payload=delta::state(previousState,state);if(!frame(stream,1,payload))alive=false;previousState=std::move(state); }
         if (!spectrum.empty() && !frame(stream,2,spectrum)) alive = false;
         if (!rfSpectrum.empty() && !frame(stream,2,rfSpectrum)) alive = false;
         if (listening) {

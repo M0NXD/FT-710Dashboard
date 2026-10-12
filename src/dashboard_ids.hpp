@@ -9,8 +9,10 @@ enum Id {
     Filter = 501, SettingsVfo, SettingsList, EditSetting,
     Activity = 601, CatCommand, CatQuery, CatWrite, CatPreset, ClearLog, Manual,
     AudioDevice = 801, AudioRefresh = 811, AudioReceive, AudioMicrophone, AudioReceiveGain, AudioMicrophoneGain, AudioPttLimit,
+    AudioUnattended = 818,
     ScopeSpan = 901, ScopeGain, ScopeFloor, ScopeFreeze, ScopePeak, ScopeClear, ScopeReceive, ScopeRouting,
     RfSpan = 920, RfCat2Port, RfCat2Baud, RfWaterfallLevel, RfCapture, RfApplySpan, RfClear
 };
 inline constexpr unsigned WebMessage = WM_APP + 3;
+inline constexpr unsigned CompletionMessage = WM_APP + 4;
 }

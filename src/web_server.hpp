@@ -25,7 +25,7 @@ public:
     using Log = std::function<void(const std::string&)>;
     Server(Handler handler, Log log);
     ~Server();
-    void start(const std::wstring& certificateFolder, const std::string& accessCode);
+    void start(const std::wstring& certificateFolder, const std::string& accessCode, bool loopbackOnly = false);
     void stop();
     void setAccessCode(const std::string& accessCode);
     std::uint64_t accessRevision() const { return accessRevision_.load(); }

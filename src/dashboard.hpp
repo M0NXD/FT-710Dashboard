@@ -8,9 +8,11 @@
 #include "scope_view.hpp"
 #include "rf_scope.hpp"
 #include "web_server.hpp"
+#include "task_queue.hpp"
 #include <memory>
 #include <array>
 #include <deque>
+#include <set>
 
 class Dashboard {
 public:
@@ -27,6 +29,12 @@ private:
     std::string webAccessCode_;
     std::wstring webError_;
     std::uint64_t browserPttOwner_ = 0;
+    std::set<std::uint64_t> browserMicClients_;
+    TaskQueue audioJobs_, scopeJobs_;
+    bool closing_ = false, audioRefreshing_ = false, rfApplying_ = false, rfCaptureWanted_ = false, rfCaptureChanging_ = false;
+    bool unattended_ = false;
+    std::uint64_t audioRefreshRevision_ = 0, rfOperationRevision_ = 0;
+    std::wstring preferencesError_;
     ULONGLONG webSpectrumTick_ = 0;
     radio::Snapshot state_;
     std::map<int, HWND> controls_;
@@ -63,7 +71,10 @@ private:
     rf_scope::Capture rfCapture_;
     rf_scope::Frame rfFrame_{};
     std::deque<std::array<std::uint8_t, rf_scope::BinCount>> rfHistory_;
+    std::vector<std::uint32_t> rfPixels_;
+    std::uint64_t rfPixelSequence_ = 0;
     std::wstring rfUiStatus_ = L"RF scope capture is off";
+    std::wstring rfApplyStatus_;
     unsigned rfLastSpan_ = 7;
     std::uint64_t rfRenderedCenterHz_ = 0;
     std::uint64_t rfRenderedSequence_ = 0;
@@ -101,6 +112,12 @@ private:
     void exportCsv();
     void releasePtt();
     void refreshAudioDevices();
+    void applyAudioDevices(std::vector<audio::Device> devices, std::wstring error);
+    void postUi(std::function<void()> completion);
+    void stopRoute(audio::Route& route);
+    void applyRfSettings(std::wstring port, unsigned span, unsigned baud, double level, std::shared_ptr<web::Request> request = {});
+    std::function<std::wstring(const std::wstring&,unsigned,unsigned,double)> scopeApply_ = rf_scope::applySpan;
+    void browserMicrophone(std::uint64_t client, bool armed);
     void updateAudio();
     void updateScope();
     void updateRfScope();

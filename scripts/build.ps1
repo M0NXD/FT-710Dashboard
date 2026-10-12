@@ -5,7 +5,7 @@ $taskVendor = Join-Path $taskRoot 'vendor'
 $taskFtdiDirectory = Join-Path $taskRoot 'runtime/ftdi'
 $taskMissingFtdi = @('FTD2XX.dll', 'LibFT4222.dll') | Where-Object { !(Test-Path -LiteralPath (Join-Path $taskFtdiDirectory $_)) }
 if ($taskMissingFtdi) {
-    throw ('The integrated RF scope needs the x64 FTDI runtime DLLs: ' + ($taskMissingFtdi -join ', ') + '. Download them from https://ftdichip.com/software-examples/ft4222h-software-examples/ and place them in ' + $taskFtdiDirectory + '.')
+    Write-Output ('RF capture runtime not staged: ' + ($taskMissingFtdi -join ', ') + '. The app can be built; obtain optional DLLs from https://ftdichip.com/software-examples/ft4222h-software-examples/ to use RF capture.')
 }
 $taskSdk = Join-Path $taskVendor 'hamlib-w64-4.7.2'
 if (!(Test-Path -LiteralPath (Join-Path $taskSdk 'include/hamlib/rig.h'))) {

@@ -5,6 +5,7 @@
 203 RCDATA "@CMAKE_SOURCE_DIR@/web/app.js"
 204 RCDATA "@CMAKE_SOURCE_DIR@/web/audio-worklet.js"
 205 RCDATA "@CMAKE_SOURCE_DIR@/web/audio-playback.js"
+207 RCDATA "@CMAKE_SOURCE_DIR@/web/control-core.js"
 206 DIALOGEX 0, 0, 340, 166
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Web server passcode"

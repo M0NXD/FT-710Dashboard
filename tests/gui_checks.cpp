@@ -1,4 +1,5 @@
 #include "dashboard.hpp"
+#include "station_settings.hpp"
 #include <algorithm>
 #include <iostream>
 #include <condition_variable>
@@ -71,6 +72,13 @@ struct DashboardChecks {
         worker.stop();
     }
     static int run() {
+        station_settings::Fields fields{{"kind","0"},{"endpoint","COM4"},{"baud","38400"},{"stopBits","1"},{"flow","None"},{"poll","750"},{"rfCat2Port","COM5"},{"rfSpan","7"},{"rfCat2Baud","4800"},{"rfWaterfallLevel","-5.0"}};
+        expect(station_settings::connection(fields).endpoint == "COM4","shared connection model validates native/browser fields");
+        expect(station_settings::scope(fields,true).level == -5.0,"shared scope model validates level and CAT-2 settings");
+        auto invalid = fields;invalid["flow"]="invalid";bool rejected=false;try{station_settings::connection(invalid);}catch(const std::exception&){rejected=true;}
+        expect(rejected,"invalid connection request is rejected before applying fields");
+        invalid=fields;invalid["rfWaterfallLevel"]="-5.25";rejected=false;try{station_settings::scope(invalid);}catch(const std::exception&){rejected=true;}
+        expect(rejected,"invalid scope request is rejected before applying fields");
         HINSTANCE instance = GetModuleHandleW(nullptr);
         INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES};
         InitCommonControlsEx(&controls);
@@ -146,12 +154,21 @@ struct DashboardChecks {
         app.pttLatched_ = true; app.pttPending_ = true; app.pttRequested_ = std::chrono::steady_clock::now(); app.update(s);
         expect(text(app.controls_[Ptt]) == L"PTT off" && text(app.controls_[PttLatch]) == L"PTT off", "both PTT buttons stay synchronized");
         app.pttLatched_ = app.pttPending_ = false;
+        app.scopeApply_ = [](const auto&,unsigned,unsigned,double) { std::this_thread::sleep_for(std::chrono::milliseconds(150));return std::wstring{}; };
+        auto started = std::chrono::steady_clock::now();app.applyRfSettings(L"COM99",7,4800,-5);
+        expect(std::chrono::steady_clock::now()-started < std::chrono::milliseconds(100),"slow scope settings run without blocking GUI dispatch");
+        app.microphoneWanted_ = true;app.audioSelectedIds_[2] = audio::BrowserMicrophone;
+        app.browserMicClients_ = {1,2};app.browserPttOwner_ = 2;
+        app.browserMicrophone(1,false);
+        expect(app.microphoneWanted_ && app.browserPttOwner_ == 2,"disarming non-owner keeps shared mic route and owner");
+        app.pttLatched_ = true;app.browserMicrophone(2,false);
+        expect(!app.microphoneWanted_ && !app.browserPttOwner_,"disconnecting final owner releases PTT and mic route");
         // All pages, small/full windows and 100/125/150/200 percent font scales.
         for (unsigned dpi : {96u, 120u, 144u, 192u}) {
             app.dpi_ = dpi; app.fonts();
             for (auto size : {SIZE{1280, 900}, SIZE{800, 540}}) {
                 SetWindowPos(window, nullptr, 0, 0, app.scale(size.cx), app.scale(size.cy), SWP_NOZORDER | SWP_NOACTIVATE);
-                for (int page = 0; page < 4; ++page) { app.page_ = page; app.layout(); layout(app); }
+                for (int page = 0; page < 6; ++page) { app.page_ = page; app.layout(); layout(app); }
                 if (size.cx == 800) {
                     SCROLLINFO info{sizeof(info), SIF_ALL, 0, 0, 0, 0, 0}; GetScrollInfo(window, SB_VERT, &info);
                     expect(info.nMax >= static_cast<int>(info.nPage), "small window exposes vertical scrolling");
@@ -162,9 +179,12 @@ struct DashboardChecks {
                 }
             }
         }
+        app.audioJobs_.stop(); app.scopeJobs_.stop();
+        MSG completion{};
+        while (PeekMessageW(&completion,window,WM_APP+4,WM_APP+4,PM_REMOVE)) app.handle(completion.message,completion.wParam,completion.lParam);
         DestroyWindow(window); app.window_ = nullptr;
         radioRevisions();
-        std::cout << "GUI checks passed: " << checks << " assertions (snapshot ordering, drafts, PTT, all four tabs, resize and DPI).\n";
+        std::cout << "GUI checks passed: " << checks << " assertions (snapshot ordering, drafts, PTT, all six tabs, resize and DPI).\n";
         return 0;
     }
 };

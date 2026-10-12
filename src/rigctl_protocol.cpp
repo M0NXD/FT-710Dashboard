@@ -150,11 +150,8 @@ CatReply Worker::executeCat(const CatRequest& request) {
         return fail(-RIG_EIO);
     if (name == "__release_client") {
         if (catPttOwner_ == request.client) {
-            reply.result = rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF);
-            // Keep ownership on failure so radio disconnect/shutdown retries.
-            if (reply.result == RIG_OK) { catPttOwner_ = 0; state_.transmitting = false; }
+            reply.result = releaseTransmit("Release PTT for disconnected CAT client " + std::to_string(request.client));
             reply.changed = true;
-            report("Release PTT for disconnected CAT client " + std::to_string(request.client), reply.result);
         }
         return reply;
     }
@@ -226,8 +223,8 @@ CatReply Worker::executeCat(const CatRequest& request) {
         need(0); ptt_t status{}; reply.result = rig_get_ptt(rig_, vfo, &status); add("PTT", std::to_string(status));
     } else if (name == "set_ptt") {
         need(1); int status = integer(args[0]); if (status < 0 || status > 3) return fail(-RIG_EINVAL);
-        if (status != 0 && (heldPtt_ || (catPttOwner_ && catPttOwner_ != request.client))) return fail(-RIG_ERJCTED);
-        reply.result = rig_set_ptt(rig_, vfo, static_cast<ptt_t>(status));
+        if (status != 0 && (state_.releasePending || heldPtt_ || (catPttOwner_ && catPttOwner_ != request.client))) return fail(-RIG_ERJCTED);
+        reply.result = status == 0 ? releaseTransmit("CAT PTT release") : rig_set_ptt(rig_, vfo, static_cast<ptt_t>(status));
         if (reply.result == RIG_OK) {
             catPttOwner_ = status ? request.client : 0;
             if (!status) heldPtt_ = false;

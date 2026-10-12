@@ -126,11 +126,11 @@ void Route::gate(bool enabled) {
 }
 void Route::gain(float value) { gain_ = std::clamp(value, 0.0f, 1.0f); }
 void Route::stop() {
-    gate(false);
-    if (stopEvent_) SetEvent(stopEvent_);
+    requestStop();
     if (thread_.joinable()) thread_.join();
     std::lock_guard lock(mutex_); status_ = {};
 }
+void Route::requestStop() { gate(false); if (stopEvent_) SetEvent(stopEvent_); }
 void Route::start(const std::wstring& source, const std::wstring& destination) {
     stop();
     if (!stopEvent_) throw std::runtime_error("Cannot create the audio stop event.");

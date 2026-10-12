@@ -27,6 +27,7 @@ public:
     ~Route();
     void start(const std::wstring& source, const std::wstring& destination);
     void stop();
+    void requestStop();
     void gate(bool enabled);
     void gain(float value);
     Status status() const;
