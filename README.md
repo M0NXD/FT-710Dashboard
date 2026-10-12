@@ -8,7 +8,32 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 ### Runtime dependencies
 
-The release ZIP contains `FT710Dashboard.exe`, this README, and `check-runtime.ps1`. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** Install the matching **64-bit Hamlib 4.7.2 runtime** and make its `bin` directory available on `PATH`. The application requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. Obtain Hamlib from its [official 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2). If the Hamlib package does not provide a compatible `libwinpthread-1.dll`, install a current x64 POSIX MinGW-w64 distribution such as [WinLibs](https://winlibs.com/) and make its `mingw64/bin` directory available on `PATH`.
+The release ZIP contains `FT710Dashboard.exe`, this README, and `check-runtime.ps1`. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** It requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. The direct downloads below match the Hamlib and WinLibs compiler versions used for **dashboard 2.0.5**.
+
+#### Direct downloads and quick setup
+
+| Required component | Direct download | Files to use from the extracted package |
+| --- | --- | --- |
+| Hamlib **4.7.2, Windows x64** | [Download Hamlib x64 ZIP](https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.zip) | `hamlib-w64-4.7.2\bin\libhamlib-4.dll` and `hamlib-w64-4.7.2\bin\libusb-1.0.dll` |
+| MinGW runtime — WinLibs **GCC 15.2.0, x64, POSIX, UCRT, release 4** | [Download matching WinLibs/MinGW x64 ZIP](https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip) | `mingw64\bin\libwinpthread-1.dll` |
+
+1. Extract the dashboard release ZIP into its own folder.
+2. Download and extract the two upstream ZIPs above. Copy the **two Hamlib DLLs** and **the WinLibs `libwinpthread-1.dll`** into the dashboard folder, beside `FT710Dashboard.exe`. You do not need to install a compiler to run the dashboard.
+3. Use the threading DLL from the linked WinLibs package. An older `libwinpthread-1.dll` supplied by another application or Hamlib package may lack `clock_gettime64` and prevent the dashboard from starting.
+4. Run `powershell -ExecutionPolicy Bypass -File .\check-runtime.ps1` from the dashboard folder, then open `FT710Dashboard.exe`.
+
+The minimum application folder contains:
+
+```text
+FT710Dashboard.exe
+libhamlib-4.dll
+libusb-1.0.dll
+libwinpthread-1.dll
+README.md
+check-runtime.ps1
+```
+
+Alternative Hamlib installation: [download the Hamlib x64 installer](https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.exe) and make its installed `bin` directory available on `PATH`; still use the compatible WinLibs threading DLL beside the dashboard. The [Hamlib release page](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2) and [WinLibs release page](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-13.0.0-ucrt-r4) provide package details and upstream checksums.
 
 The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Obtain them from the two separate FTDI packages below and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
 

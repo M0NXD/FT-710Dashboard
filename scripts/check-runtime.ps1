@@ -56,8 +56,9 @@ foreach ($runtimeName in @('FTD2XX.dll','LibFT4222.dll')) {
     elseif (!(Test-X64Runtime $runtimePath)) { Write-Output ('OPTIONAL RF CAPTURE WRONG ARCHITECTURE: ' + $runtimePath) }
     else { Write-Output ('OPTIONAL RF CAPTURE FOUND x64: ' + $runtimePath) }
 }
-Write-Output 'Hamlib: https://github.com/Hamlib/Hamlib/releases/tag/4.7.2'
-Write-Output 'Compiler runtime: https://winlibs.com/'
+Write-Output 'Hamlib x64 ZIP: https://github.com/Hamlib/Hamlib/releases/download/4.7.2/hamlib-w64-4.7.2.zip'
+Write-Output 'WinLibs/MinGW x64 ZIP: https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip'
+Write-Output 'Copy libhamlib-4.dll and libusb-1.0.dll from the Hamlib bin folder; use libwinpthread-1.dll from the WinLibs mingw64/bin folder beside the dashboard EXE.'
 Write-Output 'FTD2XX.dll: https://ftdichip.com/drivers/d2xx-drivers/ (Windows Desktop x64 driver package)'
 Write-Output 'LibFT4222.dll: https://ftdichip.com/software-examples/ft4222h-software-examples/ (Windows x64 library; rename LibFT4222-64.dll)'
 Write-Output 'RF capture requires SCU-LAN10 = ON on the FT-710.'
