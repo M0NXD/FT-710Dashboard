@@ -58,7 +58,8 @@ foreach ($runtimeName in @('FTD2XX.dll','LibFT4222.dll')) {
 }
 Write-Output 'Hamlib: https://github.com/Hamlib/Hamlib/releases/tag/4.7.2'
 Write-Output 'Compiler runtime: https://winlibs.com/'
-Write-Output 'FTDI scope DLLs: https://ftdichip.com/software-examples/ft4222h-software-examples/'
+Write-Output 'FTD2XX.dll: https://ftdichip.com/drivers/d2xx-drivers/ (Windows Desktop x64 driver package)'
+Write-Output 'LibFT4222.dll: https://ftdichip.com/software-examples/ft4222h-software-examples/ (Windows x64 library; rename LibFT4222-64.dll)'
 Write-Output 'RF capture requires SCU-LAN10 = ON on the FT-710.'
 if ($runtimeMissing) { exit 1 }
 Write-Output 'Required runtime checks passed.'

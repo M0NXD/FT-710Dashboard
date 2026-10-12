@@ -5,7 +5,9 @@ $taskVendor = Join-Path $taskRoot 'vendor'
 $taskFtdiDirectory = Join-Path $taskRoot 'runtime/ftdi'
 $taskMissingFtdi = @('FTD2XX.dll', 'LibFT4222.dll') | Where-Object { !(Test-Path -LiteralPath (Join-Path $taskFtdiDirectory $_)) }
 if ($taskMissingFtdi) {
-    Write-Output ('RF capture runtime not staged: ' + ($taskMissingFtdi -join ', ') + '. The app can be built; obtain optional DLLs from https://ftdichip.com/software-examples/ft4222h-software-examples/ to use RF capture.')
+    Write-Output ('RF capture runtime not staged: ' + ($taskMissingFtdi -join ', ') + '. The app can be built; obtain the two optional DLLs separately to use RF capture.')
+    Write-Output 'FTD2XX.dll: https://ftdichip.com/drivers/d2xx-drivers/ (Windows Desktop x64 driver package)'
+    Write-Output 'LibFT4222.dll: https://ftdichip.com/software-examples/ft4222h-software-examples/ (Windows x64 library; rename LibFT4222-64.dll)'
 }
 $taskSdk = Join-Path $taskVendor 'hamlib-w64-4.7.2'
 if (!(Test-Path -LiteralPath (Join-Path $taskSdk 'include/hamlib/rig.h'))) {

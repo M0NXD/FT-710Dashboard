@@ -10,7 +10,22 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 The release ZIP contains `FT710Dashboard.exe`, this README, and `check-runtime.ps1`. **The executable is not self-contained and will not start until its Hamlib runtime dependencies are installed.** Install the matching **64-bit Hamlib 4.7.2 runtime** and make its `bin` directory available on `PATH`. The application requires `libhamlib-4.dll`, `libusb-1.0.dll` and a compatible MinGW `libwinpthread-1.dll`; none of these files are included in the GitHub release. Obtain Hamlib from its [official 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2). If the Hamlib package does not provide a compatible `libwinpthread-1.dll`, install a current x64 POSIX MinGW-w64 distribution such as [WinLibs](https://winlibs.com/) and make its `mingw64/bin` directory available on `PATH`.
 
-The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Download them from [FTDI's FT4222H software examples](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
+The FTDI `FTD2XX.dll` and `LibFT4222.dll` files are **not needed to start the dashboard or use CAT controls**. They are optional and needed only for RF scope capture. Obtain them from the two separate FTDI packages below and place them beside `FT710Dashboard.exe`. Enable **SCU-LAN10** on the radio for RF scope capture. PortAudio is statically linked, so it has no separate runtime DLL requirement. For local development builds, CMake stages dependencies into the ignored `dist/` directory; those staged files are not uploaded to GitHub.
+
+#### FTDI DLLs for RF capture
+
+**The FT4222H library download does not include the native `FTD2XX.dll`. Download both packages separately:**
+
+| Required dashboard file | Official download | Windows package to choose |
+| --- | --- | --- |
+| `FTD2XX.dll` | [FTDI D2XX drivers](https://ftdichip.com/drivers/d2xx-drivers/) | Windows **Desktop**, **x64 (64-bit)** driver package or Windows driver installer |
+| `LibFT4222.dll` | [FTDI FT4222H software examples and libraries](https://ftdichip.com/software-examples/ft4222h-software-examples/) | **LibFT4222 Windows Library (v1.4.8) and Examples** |
+
+1. Install the FTDI Windows desktop driver on the station PC. On 64-bit Windows, copy the installed `%WINDIR%\System32\FTD2XX.dll` beside `FT710Dashboard.exe`. If the downloaded driver ZIP supplies its x64 DLL as `amd64\ftd2xx64.dll`, name the copy **`FTD2XX.dll`**. The Windows USB driver must still be installed for capture to work.
+2. Extract the LibFT4222 Windows package. Copy **`imports\LibFT4222\dll\amd64\LibFT4222-64.dll`** beside `FT710Dashboard.exe` and rename the copy to **`LibFT4222.dll`**.
+3. Enable **SCU-LAN10 = ON** on the FT-710, then start RF capture. For a source build, put the same two named DLLs in `runtime/ftdi/` so CMake can stage them into `dist/`.
+
+Use **amd64/x64** files for this dashboard. `i386` and `SysWOW64` DLLs are 32-bit, ARM64 files target a different architecture, and `FTD2XX_NET.dll` is a .NET wrapper rather than the required native DLL. Neither FTDI DLL is bundled in this repository or its release ZIP.
 
 ## Features
 
@@ -63,7 +78,7 @@ CAT-1 and CAT-2 must be different COM ports. The dashboard owns CAT-1 for as lon
 
 The RF scope level adjusts the radio's waterfall reference level, not RF power or receiver gain. The scope shows the FT-710's displayed RF levels across its selected span; only the tuned receiver demodulates audio. The separate **Audio scope** displays received audio and uses the selected audio capture route.
 
-The x64 FTDI runtime DLLs are optional at build time and required beside the executable only when using RF capture. Obtain them from [FTDI's FT4222H software examples/downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place `FTD2XX.dll` and `LibFT4222.dll` in `runtime/ftdi/`. The files are excluded from Git; see [`runtime/ftdi/README.md`](runtime/ftdi/README.md). The FTDI USB driver is available from [FTDI drivers](https://ftdichip.com/drivers/).
+The x64 FTDI runtime DLLs are optional at build time and required beside the executable only when using RF capture. Get `FTD2XX.dll` from [FTDI's D2XX driver package](https://ftdichip.com/drivers/d2xx-drivers/) and `LibFT4222.dll` from [FTDI's FT4222H library package](https://ftdichip.com/software-examples/ft4222h-software-examples/); see [FTDI DLLs for RF capture](#ftdi-dlls-for-rf-capture) for the file locations and naming instructions. For source builds, place both files in `runtime/ftdi/`. The files are excluded from Git; see [`runtime/ftdi/README.md`](runtime/ftdi/README.md).
 
 ## Connect your FT-710
 
@@ -253,7 +268,7 @@ PTT from either dashboard button is released by the app; PTT initiated by a micr
 
 ## Build
 
-Requires Windows x64, MinGW-w64 `gcc`/`g++`, CMake 3.24+ and Ninja on PATH. The project uses Win32/common controls/GDI rather than requiring a GUI framework installation. Hamlib is dynamically linked; the build script downloads the official 4.7.2 Windows SDK and verifies its pinned SHA256. It also obtains SHA256-pinned PortAudio 19.7.0 and statically builds the WASAPI/WDM-KS drivers. To stage RF capture dependencies for local use, optionally provide the x64 FTDI runtime files: download `FTD2XX.dll` and `LibFT4222.dll` from [FTDI's FT4222H downloads](https://ftdichip.com/software-examples/ft4222h-software-examples/) and place them in `runtime/ftdi/`. The build copies required runtime DLLs beside the executable; third-party files are not tracked in Git. Packaging takes the threading and GCC runtime DLLs from the actual compiler, so newer compilers receive their required `clock_gettime64` implementation.
+Requires Windows x64, MinGW-w64 `gcc`/`g++`, CMake 3.24+ and Ninja on PATH. The project uses Win32/common controls/GDI rather than requiring a GUI framework installation. Hamlib is dynamically linked; the build script downloads the official 4.7.2 Windows SDK and verifies its pinned SHA256. It also obtains SHA256-pinned PortAudio 19.7.0 and statically builds the WASAPI/WDM-KS drivers. To stage RF capture dependencies for local use, optionally provide the x64 FTDI runtime files: get `FTD2XX.dll` from [FTDI's D2XX driver package](https://ftdichip.com/drivers/d2xx-drivers/) and `LibFT4222.dll` from [FTDI's FT4222H library package](https://ftdichip.com/software-examples/ft4222h-software-examples/), then place them in `runtime/ftdi/`. Follow [FTDI DLLs for RF capture](#ftdi-dlls-for-rf-capture) for the x64 file locations and required names. The build copies required runtime DLLs beside the executable; third-party files are not tracked in Git. Packaging takes the threading and GCC runtime DLLs from the actual compiler, so newer compilers receive their required `clock_gettime64` implementation.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1
@@ -345,6 +360,8 @@ Third-party source archives and binaries are intentionally kept out of GitHub. T
 Hamlib 4.7.2 is dynamically linked using its FT-710 backend. See the [official Hamlib 4.7.2 release](https://github.com/Hamlib/Hamlib/releases/tag/4.7.2), [rig API](https://hamlib.sourceforge.net/manuals/4.7/group__rig.html), and [rigctld protocol reference](https://hamlib.sourceforge.net/html/rigctld.1.html). PortAudio 19.7.0 is statically linked; its upstream [API documentation](https://portaudio.com/docs/v19-doxydocs/api_overview.html) describes device and audio interfaces. `src/portaudio_wdmks.c` adapts the upstream WDM-KS driver to expose a stable device identity.
 
 - [Hamlib FT-710 backend](https://github.com/Hamlib/Hamlib/blob/4.7.2/rigs/yaesu/ft710.c)
+- [FTDI D2XX Windows desktop driver package — FTD2XX.dll](https://ftdichip.com/drivers/d2xx-drivers/)
+- [FTDI FT4222H Windows library package — LibFT4222.dll](https://ftdichip.com/software-examples/ft4222h-software-examples/)
 - [Yaesu FT-710 CAT reference](https://www.yaesu.com/Files/4CB893D7-1018-01AF-FA97E9E9AD48B50C/FT-710_CAT_OM_ENG_2306-C.pdf)
 - [Yaesu FT-710 downloads and USB driver](https://yaesu.com/product-detail.aspx?CatName=HF+Transceivers%2FAmplifiers&Model=FT-710)
 
