@@ -59,6 +59,7 @@ $releaseLicences = @(
     @{dependency='mingw-w64';member='mingw-w64-13.0.0/COPYING.MinGW-w64/COPYING.MinGW-w64.txt';target='licenses/mingw-w64/COPYING.MinGW-w64.txt'},
     @{dependency='portaudio';member='portaudio-19.7.0/LICENSE.txt';target='licenses/portaudio/LICENSE.txt'},
     @{dependency='gcc-license';target='licenses/gcc/COPYING3.txt'},
+    @{dependency='boost-license';target='licenses/gcc/BOOST_LICENSE_1_0.txt'},
     @{dependency='gcc-exception';target='licenses/gcc/COPYING.RUNTIME.txt'}
 )
 $releaseExtracted = @{}
@@ -114,6 +115,30 @@ $releasePortAudioNoticePath = Join-Path $releaseStage 'licenses/portaudio/SOURCE
 [IO.File]::WriteAllText($releasePortAudioNoticePath,$releasePortAudioCatalogue.ToString(),[Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath $releasePortAudioNoticePath -Destination (Join-Path $releaseSourceStage 'PORTAUDIO_SOURCE_NOTICES.txt')
 
+# libstdc++ carries additional STL and Boost-derived copyright notices.
+$releaseCompiler = Get-Command g++ -ErrorAction Stop
+$releaseCompilerVersion = (& $releaseCompiler.Source -dumpfullversion).Trim()
+if ($LASTEXITCODE -or $releaseCompilerVersion -ne '15.2.0') { throw 'Use the pinned GCC 15.2.0 toolchain when producing runtime attribution notices.' }
+$releaseCompilerRoot = Split-Path -Parent (Split-Path -Parent $releaseCompiler.Source)
+$releaseGccInclude = Join-Path $releaseCompilerRoot 'include/c++/15.2.0'
+if (!(Test-Path -LiteralPath $releaseGccInclude -PathType Container)) { throw 'The pinned libstdc++ header directory is missing.' }
+$releaseGccCatalogue = [Text.StringBuilder]::new()
+[void]$releaseGccCatalogue.AppendLine('GCC 15.2.0 / libstdc++ - original header attribution and permission notices')
+[void]$releaseGccCatalogue.AppendLine('From the release toolchain include/c++/15.2.0 tree; the catalogue also retains notices for unused headers.')
+foreach ($releaseGccFile in (Get-ChildItem -LiteralPath $releaseGccInclude -Recurse -File | Where-Object { $_.Extension -in @('','.h','.tcc') } | Sort-Object FullName)) {
+    $releaseGccComments = @([regex]::Matches([IO.File]::ReadAllText($releaseGccFile.FullName),'(?s)/\*.*?\*/|(?m)(?:^[ \t]*//[^\r\n]*(?:\r?\n|$))+') | Where-Object { $_.Value -match '(?i)copyright|permission to|permission is hereby|boost software license|gcc runtime library exception|gnu general public license|@author|contribut' })
+    if (!$releaseGccComments.Count) { continue }
+    [void]$releaseGccCatalogue.AppendLine()
+    [void]$releaseGccCatalogue.AppendLine('File: ' + $releaseGccFile.FullName.Substring($releaseGccInclude.Length + 1).Replace('\','/'))
+    foreach ($releaseGccComment in $releaseGccComments) { [void]$releaseGccCatalogue.AppendLine($releaseGccComment.Value) }
+}
+$releaseGccNoticePath = Join-Path $releaseStage 'licenses/gcc/SOURCE_NOTICES.txt'
+[IO.File]::WriteAllText($releaseGccNoticePath,$releaseGccCatalogue.ToString(),[Text.UTF8Encoding]::new($false))
+Copy-Item -LiteralPath $releaseGccNoticePath -Destination (Join-Path $releaseSourceStage 'GCC_SOURCE_NOTICES.txt')
+Copy-Item -LiteralPath (Join-Path $releaseStage 'licenses/gcc/COPYING3.txt') -Destination (Join-Path $releaseSourceStage 'GCC_COPYING3.txt')
+Copy-Item -LiteralPath (Join-Path $releaseStage 'licenses/gcc/COPYING.RUNTIME.txt') -Destination (Join-Path $releaseSourceStage 'GCC_COPYING.RUNTIME.txt')
+Copy-Item -LiteralPath (Join-Path $releaseStage 'licenses/gcc/BOOST_LICENSE_1_0.txt') -Destination (Join-Path $releaseSourceStage 'BOOST_LICENSE_1_0.txt')
+
 $releaseSourceArchives = @($releaseDependencies.downloads | Where-Object { $_.sourceArchive })
 $releaseManifest = [ordered]@{
     applicationVersion = $releaseVersion
@@ -151,7 +176,7 @@ function Write-ReleaseZip([string]$Stage, [string]$Name, [string[]]$Allowed) {
     Set-Content -LiteralPath ($releaseZipPath + '.sha256') -Value ($releaseZipHash + '  ' + [IO.Path]::GetFileName($releaseZipPath)) -Encoding ascii
     Write-Output ($Name + ' SHA256: ' + $releaseZipHash)
 }
-$releaseAllowed = @('FT710Dashboard.exe','README.md','check-runtime.ps1','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','licenses/portaudio/SOURCE_NOTICES.txt') + $releaseRuntimeNames + @($releaseLicences | ForEach-Object { $_.target })
-$releaseSourceAllowed = @('README.md','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','dashboard-portaudio_wdmks.c','PORTAUDIO_SOURCE_NOTICES.txt') + @($releaseSourceArchives | ForEach-Object { $_.file })
+$releaseAllowed = @('FT710Dashboard.exe','README.md','check-runtime.ps1','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','licenses/portaudio/SOURCE_NOTICES.txt','licenses/gcc/SOURCE_NOTICES.txt') + $releaseRuntimeNames + @($releaseLicences | ForEach-Object { $_.target })
+$releaseSourceAllowed = @('README.md','THIRD_PARTY_NOTICES.md','DEPENDENCIES.json','dashboard-portaudio_wdmks.c','PORTAUDIO_SOURCE_NOTICES.txt','GCC_SOURCE_NOTICES.txt','GCC_COPYING3.txt','GCC_COPYING.RUNTIME.txt','BOOST_LICENSE_1_0.txt') + @($releaseSourceArchives | ForEach-Object { $_.file })
 Write-ReleaseZip $releaseStage ('FT710Dashboard-' + $releaseVersion + '-Windows-x64.zip') $releaseAllowed
 Write-ReleaseZip $releaseSourceStage ('FT710Dashboard-' + $releaseVersion + '-ThirdPartySources.zip') $releaseSourceAllowed

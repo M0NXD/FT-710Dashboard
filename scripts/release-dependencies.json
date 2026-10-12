@@ -78,6 +78,14 @@
       "sourceArchive": false
     },
     {
+      "id": "boost-license",
+      "file": "BOOST-LICENSE_1_0.txt",
+      "cache": "vendor/release-dependencies/BOOST-LICENSE_1_0.txt",
+      "url": "https://www.boost.org/LICENSE_1_0.txt",
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+      "sourceArchive": false
+    },
+    {
       "id": "gcc-exception",
       "file": "GCC-COPYING.RUNTIME.txt",
       "cache": "vendor/release-dependencies/GCC-COPYING.RUNTIME.txt",

@@ -40,6 +40,8 @@ The executable uses GCC 15.2.0 runtime code, including statically linked libstdc
 
 See the [GCC runtime licence explanation](https://gcc.gnu.org/onlinedocs/libstdc++/manual/license.html) and the [GCC 15.2.0 source tree](https://github.com/gcc-mirror/gcc/tree/releases/gcc-15.2.0). The runtime exception permits distribution of the application together with this runtime code under terms consistent with the independent application. No separate GCC runtime DLL or compiler is included in the ZIP.
 
+The standard-library headers also retain original STL notices credited to **Hewlett-Packard Company** and **Silicon Graphics Computer Systems, Inc.** Its shared-pointer implementation acknowledges Boost-derived work by **Peter Dimov and Multi Media Ltd.**, **Greg Colvin** and **Beman Dawes**. Their original copyright/permission comments, together with the GNU contributor notices, are preserved in `licenses/gcc/SOURCE_NOTICES.txt`. This catalogue covers the pinned toolchain's complete C++ header tree and also includes notices for headers unused by this application. The original **Boost Software License 1.0** is supplied in `licenses/gcc/BOOST_LICENSE_1_0.txt`. Both notice catalogues and the GCC/Boost licence texts are also included in the source ZIP.
+
 ### WinLibs compiler distribution
 
 **Brecht Sanders** provides the [WinLibs GCC 15.2.0 / MinGW-w64 13.0.0 x64 POSIX UCRT release 4 build](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-13.0.0-ucrt-r4) used to compile the application and obtain its matching threading DLL. WinLibs packages the upstream toolchain components; their own licences and copyrights remain applicable. The application ZIP contains the threading runtime, not the compiler/tool collection.
