@@ -85,8 +85,8 @@ void ScopeView::rasterize() {
     }
     imageRevision_ = revision_; imageSpan_ = spanHz; imageGain_ = gainDb; imageFloor_ = floorDb;
 }
-void ScopeView::paint(HDC dc, RECT spectrum, RECT waterfall, HFONT font, unsigned dpi) {
-    auto px = [&](int value) { return MulDiv(value, dpi, 96); };
+void ScopeView::paint(HDC dc, RECT spectrum, RECT waterfall, HFONT font, double uiScale) {
+    auto px = [&](int value) { return static_cast<int>(std::lround(value * uiScale)); };
     auto oldPen = SelectObject(dc, GetStockObject(DC_PEN)); SetDCPenColor(dc, Grid);
     auto background = CreateSolidBrush(RGB(8, 16, 29)); FillRect(dc, &spectrum, background); FillRect(dc, &waterfall, background); DeleteObject(background);
     for (int i = 0; i <= 4; ++i) {

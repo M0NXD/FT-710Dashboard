@@ -310,17 +310,22 @@ Dashboard::~Dashboard() {
     for (HFONT font : {bodyFont_, smallFont_, titleFont_, frequencyFont_, meterFont_}) if (font) DeleteObject(font);
     DeleteObject(backgroundBrush_); DeleteObject(inputBrush_);
 }
-int Dashboard::scale(int value) const { return MulDiv(value, dpi_, 96); }
+int Dashboard::scale(int value) const { return static_cast<int>(std::lround(value * uiScale_)); }
+double Dashboard::unscale(int value) const { return value / uiScale_; }
 void Dashboard::fonts() {
+    const std::array<int, 5> pixels{std::max(1, scale(14)), std::max(1, scale(12)),
+        std::max(1, scale(27)), std::max(1, scale(39)), std::max(1, scale(25))};
+    if (bodyFont_ && pixels == fontPixels_) return;
+    fontPixels_ = pixels;
     const std::array<HFONT, 5> oldFonts{bodyFont_, smallFont_, titleFont_, frequencyFont_, meterFont_};
-    auto make = [&](int size, int weight, const wchar_t* face) {
-        return CreateFontW(-scale(size), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
+    auto make = [&](int pixels, int weight, const wchar_t* face) {
+        return CreateFontW(-pixels, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, face);
     };
-    bodyFont_ = make(14, FW_NORMAL, L"Segoe UI");
-    smallFont_ = make(12, FW_NORMAL, L"Segoe UI");
-    titleFont_ = make(27, FW_SEMIBOLD, L"Segoe UI");
-    frequencyFont_ = make(39, FW_SEMIBOLD, L"Consolas");
-    meterFont_ = make(25, FW_SEMIBOLD, L"Segoe UI");
+    bodyFont_ = make(pixels[0], FW_NORMAL, L"Segoe UI");
+    smallFont_ = make(pixels[1], FW_NORMAL, L"Segoe UI");
+    titleFont_ = make(pixels[2], FW_SEMIBOLD, L"Segoe UI");
+    frequencyFont_ = make(pixels[3], FW_SEMIBOLD, L"Consolas");
+    meterFont_ = make(pixels[4], FW_SEMIBOLD, L"Segoe UI");
     for (auto [id, window] : controls_) { (void)id; SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(bodyFont_), FALSE); }
     for (HFONT font : oldFonts) if (font) DeleteObject(font);
 }
@@ -334,7 +339,8 @@ int Dashboard::run(int show) {
     cls.hbrBackground = backgroundBrush_;
     RegisterClassExW(&cls);
     dpi_ = GetDpiForSystem();
-    constexpr DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_HSCROLL | WS_VSCROLL;
+    uiScale_ = dpi_ / 96.0;
+    constexpr DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     RECT initial{0, 0, scale(1280), scale(CanvasMinimumHeight)};
     AdjustWindowRectExForDpi(&initial, style, FALSE, 0, dpi_);
     HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
@@ -485,8 +491,24 @@ void Dashboard::createControls() {
 }
 void Dashboard::move(int id, int x, int y, int width, int height) {
     if (y >= 175 && id != ShareCat && id != SharePort && id != OpenWeb && id != WebPasscode) y += 48;
-    x = scale(x - scrollX_); y = scale(y - scrollY_); width = scale(width); height = scale(height);
+    width = scale(x - scrollX_ + width) - scale(x - scrollX_);
+    height = scale(y - scrollY_ + height) - scale(y - scrollY_);
+    x = scale(x - scrollX_); y = scale(y - scrollY_);
     RECT old{}; GetWindowRect(controls_[id], &old); MapWindowPoints(nullptr, window_, reinterpret_cast<POINT*>(&old), 2);
+    // Native combo boxes keep a separate collapsed height. Fit that as well
+    // as the popup so a smaller font cannot leave a tall control over the next row.
+    wchar_t className[16]{}; GetClassNameW(controls_[id], className, 16);
+    if (CompareStringOrdinal(className, -1, L"COMBOBOX", -1, TRUE) == CSTR_EQUAL) {
+        int current = static_cast<int>(SendMessageW(controls_[id], CB_GETITEMHEIGHT, static_cast<WPARAM>(-1), 0));
+        if (current != CB_ERR) {
+            int chrome = std::max(0, static_cast<int>(old.bottom - old.top) - current);
+            int itemHeight = std::max(1, scale(30) - chrome);
+            if (current != itemHeight) {
+                SendMessageW(controls_[id], CB_SETITEMHEIGHT, 0, itemHeight);
+                SendMessageW(controls_[id], CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), itemHeight);
+            }
+        }
+    }
     if (old.left == x && old.top == y && old.right - old.left == width && old.bottom - old.top == height) return;
     if (layoutBatch_) layoutBatch_ = DeferWindowPos(layoutBatch_, controls_[id], nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     else SetWindowPos(controls_[id], nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -494,19 +516,20 @@ void Dashboard::move(int id, int x, int y, int width, int height) {
 void Dashboard::layout() {
     if (layingOut_ || controls_.empty() || IsIconic(window_)) return;
     layingOut_ = true;
-    RECT rect{}; GetClientRect(window_, &rect);
-    // Showing one scrollbar changes the space available to the other axis.
-    for (int pass = 0; pass < 3; ++pass) {
-        GetClientRect(window_, &rect);
-        int viewWidth = std::max(1, MulDiv(rect.right, 96, dpi_)), viewHeight = std::max(1, MulDiv(rect.bottom, 96, dpi_));
-        SCROLLINFO horizontal{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS, 0, std::max(CanvasMinimumWidth, viewWidth) - 1, static_cast<UINT>(viewWidth), scrollX_, 0};
-        SCROLLINFO vertical{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS, 0, std::max(CanvasMinimumHeight, viewHeight) - 1, static_cast<UINT>(viewHeight), scrollY_, 0};
-        SetScrollInfo(window_, SB_HORZ, &horizontal, TRUE); SetScrollInfo(window_, SB_VERT, &vertical, TRUE);
-    }
+    // Fit the minimum logical layout uniformly inside the actual client area.
+    // Keep physical monitor DPI separate: RDP can change both independently.
+    ShowScrollBar(window_, SB_BOTH, FALSE);
+    SCROLLINFO scroll{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS, 0, 0, 1, 0, 0};
+    SetScrollInfo(window_, SB_HORZ, &scroll, FALSE); SetScrollInfo(window_, SB_VERT, &scroll, FALSE);
+    RECT rect{};
     GetClientRect(window_, &rect);
-    canvasWidth_ = std::max(CanvasMinimumWidth, MulDiv(rect.right, 96, dpi_));
-    canvasHeight_ = std::max(CanvasMinimumHeight, MulDiv(rect.bottom, 96, dpi_));
-    scrollX_ = GetScrollPos(window_, SB_HORZ); scrollY_ = GetScrollPos(window_, SB_VERT);
+    if (rect.right <= 0 || rect.bottom <= 0) { layingOut_ = false; return; }
+    uiScale_ = std::min({dpi_ / 96.0, static_cast<double>(rect.right) / CanvasMinimumWidth,
+        static_cast<double>(rect.bottom) / CanvasMinimumHeight});
+    fonts();
+    canvasWidth_ = std::max(CanvasMinimumWidth, static_cast<int>(std::floor(unscale(rect.right))));
+    canvasHeight_ = std::max(CanvasMinimumHeight, static_cast<int>(std::floor(unscale(rect.bottom))));
+    scrollX_ = scrollY_ = 0;
     int width = canvasWidth_, height = canvasHeight_ - 48;
     layoutBatch_ = BeginDeferWindowPos(static_cast<int>(controls_.size()));
     move(PowerOn, width - 230, 28, 96, 35); move(PowerOff, width - 124, 28, 96, 35);
@@ -582,6 +605,25 @@ void Dashboard::layout() {
     }
     layingOut_ = false;
     RedrawWindow(window_, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+void Dashboard::fitWindowToWorkArea(const RECT* suggested) {
+    if (IsIconic(window_)) return;
+    RECT bounds{};
+    if (suggested) bounds = *suggested; else GetWindowRect(window_, &bounds);
+    if (!IsZoomed(window_)) {
+        MONITORINFO monitor{sizeof(MONITORINFO), {}, {}, 0};
+        const HMONITOR target = suggested ? MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST) : MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(target, &monitor)) {
+            int width = std::min(static_cast<int>(bounds.right - bounds.left), static_cast<int>(monitor.rcWork.right - monitor.rcWork.left));
+            int height = std::min(static_cast<int>(bounds.bottom - bounds.top), static_cast<int>(monitor.rcWork.bottom - monitor.rcWork.top));
+            bounds.left = std::clamp(bounds.left, monitor.rcWork.left, monitor.rcWork.right - width);
+            bounds.top = std::clamp(bounds.top, monitor.rcWork.top, monitor.rcWork.bottom - height);
+            bounds.right = bounds.left + width; bounds.bottom = bounds.top + height;
+        }
+    } else if (!suggested) return;
+    RECT current{}; GetWindowRect(window_, &current);
+    if (!EqualRect(&current, &bounds)) SetWindowPos(window_, nullptr, bounds.left, bounds.top,
+        bounds.right - bounds.left, bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 void Dashboard::scrollCanvas(int bar, UINT code) {
     SCROLLINFO info{sizeof(SCROLLINFO), SIF_ALL, 0, 0, 0, 0, 0};
@@ -792,7 +834,7 @@ void Dashboard::paint(HDC dc) {
         card(dc, r(28, 577, w - 56, h - 650));
         label(48, 583, 208, 24, L"WATERFALL  /  AUDIO Hz", bodyFont_, Blue);
         label(270, 584, w - 318, 22, scope_.historyDetail(), smallFont_, Muted, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        scope_.paint(dc, r(94, 429, w - 140, 105), r(94, 614, w - 140, h - 701), smallFont_, dpi_);
+        scope_.paint(dc, r(94, 429, w - 140, 105), r(94, 614, w - 140, h - 701), smallFont_, uiScale_);
     } else if (page_ == 5) {
         label(32, 228, w - 64, 32, L"FT-710 RF SCOPE  /  FT4222 USB SPI", bodyFont_);
         const auto active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
@@ -1750,6 +1792,7 @@ void Dashboard::capture() {
     RECT rect{}; GetClientRect(window_, &rect);
     std::ofstream metadata{std::filesystem::path(capturePath_ + L".txt")};
     metadata << "DPI: " << dpi_ << "\nClient: " << rect.right << 'x' << rect.bottom
+        << "\nUI scale: " << uiScale_
         << "\nCanvas: " << canvasWidth_ << 'x' << canvasHeight_
         << "\nScroll: " << scrollX_ << ',' << scrollY_
         << "\nCAT sharing requested: " << sharingWanted_ << "\nCAT sharing button: " << narrow(textOf(controls_[ShareCat]))
@@ -1860,6 +1903,7 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         dpi_ = GetDpiForWindow(window_);
+        uiScale_ = dpi_ / 96.0;
         BOOL dark = TRUE; DwmSetWindowAttribute(window_, 20, &dark, sizeof dark);
         WTSRegisterSessionNotification(window_, NOTIFY_FOR_THIS_SESSION);
         createControls(); layout(); update(state_); return 0;
@@ -1871,8 +1915,7 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         if (tuningWheel(wp, lp)) return 0;
         SCROLLINFO info{sizeof(SCROLLINFO), SIF_ALL, 0, 0, 0, 0, 0};
-        GetScrollInfo(window_, SB_VERT, &info);
-        if (info.nMax >= static_cast<int>(info.nPage)) {
+        if (GetScrollInfo(window_, SB_VERT, &info) && info.nMax >= static_cast<int>(info.nPage)) {
             int delta = MulDiv(GET_WHEEL_DELTA_WPARAM(wp), 96, WHEEL_DELTA);
             int position = std::clamp(info.nPos - delta, 0, info.nMax - static_cast<int>(info.nPage) + 1);
             if (position != info.nPos) { scrollY_ = position; SetScrollPos(window_, SB_VERT, position, TRUE); layout(); }
@@ -1880,14 +1923,16 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_GETMINMAXINFO: {
-        auto* info = reinterpret_cast<MINMAXINFO*>(lp); info->ptMinTrackSize.x = scale(800); info->ptMinTrackSize.y = scale(540); return 0;
-    }
     case WM_DPICHANGED: {
-        dpi_ = HIWORD(wp); fonts(); auto* rect = reinterpret_cast<RECT*>(lp);
-        SetWindowPos(window_, nullptr, rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        dpi_ = HIWORD(wp);
+        fitWindowToWorkArea(reinterpret_cast<RECT*>(lp));
         layout(); return 0;
     }
+    case WM_DISPLAYCHANGE:
+        fitWindowToWorkArea(); layout(); return 0;
+    case WM_SETTINGCHANGE:
+        if (wp == SPI_SETWORKAREA) { fitWindowToWorkArea(); layout(); }
+        break;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps{}; HDC dc = BeginPaint(window_, &ps);
@@ -1905,8 +1950,8 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: command(LOWORD(wp), HIWORD(wp)); return 0;
     case WM_LBUTTONUP: {
         if (page_ == 5 && rfCapture_.running() && rfFrame_.fresh()) {
-            const int x = MulDiv(GET_X_LPARAM(lp), 96, dpi_) + scrollX_;
-            const int y = MulDiv(GET_Y_LPARAM(lp), 96, dpi_) + scrollY_;
+            const double x = unscale(GET_X_LPARAM(lp)) + scrollX_;
+            const double y = unscale(GET_Y_LPARAM(lp)) + scrollY_;
             const int plotX = 94, plotY = 429 + 48, plotWidth = canvasWidth_ - 140, plotHeight = 105;
             const auto& active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
             const auto center = rfFrame_.frequencyValid ? rfFrame_.centerHz : active.frequencyValid ? static_cast<std::uint64_t>(std::llround(active.frequency)) : 0;

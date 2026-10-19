@@ -165,17 +165,16 @@ struct DashboardChecks {
         expect(!app.microphoneWanted_ && !app.browserPttOwner_,"disconnecting final owner releases PTT and mic route");
         // All pages, small/full windows and 100/125/150/200 percent font scales.
         for (unsigned dpi : {96u, 120u, 144u, 192u}) {
-            app.dpi_ = dpi; app.fonts();
+            app.dpi_ = dpi;
             for (auto size : {SIZE{1280, 900}, SIZE{800, 540}}) {
-                SetWindowPos(window, nullptr, 0, 0, app.scale(size.cx), app.scale(size.cy), SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(window, nullptr, 0, 0, MulDiv(size.cx, dpi, 96), MulDiv(size.cy, dpi, 96), SWP_NOZORDER | SWP_NOACTIVATE);
                 for (int page = 0; page < 6; ++page) { app.page_ = page; app.layout(); layout(app); }
                 if (size.cx == 800) {
-                    SCROLLINFO info{sizeof(info), SIF_ALL, 0, 0, 0, 0, 0}; GetScrollInfo(window, SB_VERT, &info);
-                    expect(info.nMax >= static_cast<int>(info.nPage), "small window exposes vertical scrolling");
+                    RECT client{}; GetClientRect(window, &client);
+                    expect(!(GetWindowLongPtrW(window, GWL_STYLE) & (WS_HSCROLL | WS_VSCROLL)), "small window fits without outer scrollbars");
+                    expect(app.scale(app.canvasWidth_) <= client.right && app.scale(app.canvasHeight_) <= client.bottom, "scaled canvas fits the client area");
                     app.scrollCanvas(SB_VERT, SB_BOTTOM); app.scrollCanvas(SB_HORZ, SB_BOTTOM);
-                    expect(app.scrollY_ > 0 && app.scrollX_ > 0, "canvas can scroll to bottom and right edge");
-                    app.scrollCanvas(SB_VERT, SB_TOP); app.scrollCanvas(SB_HORZ, SB_TOP);
-                    expect(app.scrollX_ == 0 && app.scrollY_ == 0, "canvas can return to origin");
+                    expect(app.scrollX_ == 0 && app.scrollY_ == 0, "fitted canvas stays at the origin");
                 }
             }
         }

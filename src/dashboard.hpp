@@ -43,6 +43,8 @@ private:
     std::vector<std::wstring> activity_;
     int page_ = 0;
     unsigned dpi_ = 96;
+    double uiScale_ = 1.0;
+    std::array<int, 5> fontPixels_{};
     HFONT bodyFont_ = nullptr, smallFont_ = nullptr, titleFont_ = nullptr, frequencyFont_ = nullptr, meterFont_ = nullptr;
     HBRUSH backgroundBrush_ = nullptr, inputBrush_ = nullptr;
     bool demoAtStart_ = false, updating_ = false, preview_ = false, layingOut_ = false;
@@ -89,6 +91,7 @@ private:
     HWND control(int id, const wchar_t* cls, const wchar_t* text, DWORD style, int page = -1);
     void fonts();
     void layout();
+    void fitWindowToWorkArea(const RECT* suggested = nullptr);
     void scrollCanvas(int bar, UINT code);
     void invalidateArea(int x, int y, int width, int height);
     void invalidateLive();
@@ -134,6 +137,7 @@ private:
     void capture();
     void move(int id, int x, int y, int width, int height);
     int scale(int value) const;
+    double unscale(int value) const;
     static LRESULT CALLBACK windowProc(HWND, UINT, WPARAM, LPARAM);
     static LRESULT CALLBACK tuningProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     static LRESULT CALLBACK buttonProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);

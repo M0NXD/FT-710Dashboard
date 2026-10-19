@@ -20,7 +20,7 @@ public:
     double span() const;
     std::wstring detail() const;
     std::wstring historyDetail() const;
-    void paint(HDC dc, RECT spectrum, RECT waterfall, HFONT font, unsigned dpi);
+    void paint(HDC dc, RECT spectrum, RECT waterfall, HFONT font, double uiScale);
 private:
     static constexpr unsigned History = 300, ImageWidth = 1024;
     struct Row { std::array<float, audio::SpectrumFrame::Bins> db{}; ULONGLONG tick = 0; };

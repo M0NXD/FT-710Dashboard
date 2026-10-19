@@ -1,6 +1,6 @@
 # FT-710 Dashboard — Remote Control for Yaesu FT-710
 
-A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.7** keeps frequency and mode readbacks current during transmission, retains the DNR readback fix, and provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The Windows release ZIP bundles the required **Hamlib, libusb and threading runtime DLLs**, with their licences and notices. **FTDI DLLs for RF capture are downloaded separately.** The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.8** automatically scales the desktop interface to fit smaller windows and phone/RDP screens, retains the DNR and transmit readback fixes, and provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The Windows release ZIP bundles the required **Hamlib, libusb and threading runtime DLLs**, with their licences and notices. **FTDI DLLs for RF capture are downloaded separately.** The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
 
 ## Remote control at a glance
 
@@ -10,17 +10,17 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 **Download the Windows x64 release ZIP and extract the whole folder. No separate Hamlib or compiler installation is needed to run that package.** It includes `FT710Dashboard.exe`, `libhamlib-4.dll`, `libusb-1.0.dll`, the matching `libwinpthread-1.dll`, this README, `check-runtime.ps1`, `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the `licenses/` directory. Keep the DLLs beside the executable and retain the notices/licences when copying or redistributing the package.
 
-The [same GitHub release](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.7) provides **FT710Dashboard-2.0.7-ThirdPartySources.zip**, containing the corresponding Hamlib 4.7.2 and libusb 1.0.24 sources, plus MinGW-w64 13.0.0 and PortAudio 19.7.0 sources. See [third-party notices](THIRD_PARTY_NOTICES.md) for provenance, LGPL replacement permissions and licence details. The application uses external, replaceable Hamlib and libusb DLLs.
+The [same GitHub release](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.8) provides **FT710Dashboard-2.0.8-ThirdPartySources.zip**, containing the corresponding Hamlib 4.7.2 and libusb 1.0.24 sources, plus MinGW-w64 13.0.0 and PortAudio 19.7.0 sources. See [third-party notices](THIRD_PARTY_NOTICES.md) for provenance, LGPL replacement permissions and licence details. The application uses external, replaceable Hamlib and libusb DLLs.
 
 #### Direct downloads and quick setup
 
-1. [Download the dashboard Windows x64 ZIP](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.7/FT710Dashboard-2.0.7-Windows-x64.zip).
+1. [Download the dashboard Windows x64 ZIP](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.8/FT710Dashboard-2.0.8-Windows-x64.zip).
 2. Extract **all files and folders**, then open `FT710Dashboard.exe`. Moving only the executable elsewhere will leave its required DLLs behind.
 3. Install Yaesu's USB COM driver and configure the radio connection as described below. For RF capture, separately install the FTDI driver, obtain the two FTDI DLLs and enable **SCU-LAN10 = ON**; see [FTDI DLLs for RF capture](#ftdi-dlls-for-rf-capture).
 
 If Windows reports a missing entry point or DLL, run `powershell -ExecutionPolicy Bypass -File .\check-runtime.ps1` from the extracted dashboard folder. The helper checks the packaged runtime versions without opening a radio connection.
 
-**Manual downloads are only needed for the standalone EXE, a source build, or replacement runtime files.** These links match the versions used by dashboard 2.0.7:
+**Manual downloads are only needed for the standalone EXE, a source build, or replacement runtime files.** These links match the versions used by dashboard 2.0.8:
 
 | Required component | Direct download | Files to use from the extracted package |
 | --- | --- | --- |
@@ -338,7 +338,7 @@ For interactive GUI inspection using Hamlib Dummy without changing saved prefere
 
 Interactive `--preview` / `--scope-demo` also start the HTTPS web interface and HTTP certificate setup on 8888, using a temporary access code. The web page is labelled **DEMO**, and `--scope-demo` labels its spectrum **GENERATED AUDIO**. These modes open no physical radio/audio stream and do not save connection/audio preferences. `--capture` disables the web server entirely.
 
-On smaller screens, use the window scrollbars to reach the full layout. Mouse-wheel tuning remains active over the frequency display and tuning strip; elsewhere, the wheel scrolls the window when needed.
+On smaller screens, the desktop interface automatically shrinks its fonts, controls and scopes together so the entire layout fits the window without outer scrollbars. Enlarging the window returns the interface to its normal size for the monitor DPI. Resolution, DPI and work-area changes during an RDP session also keep the window on screen. Settings tables and activity logs retain their own internal scrolling. Mouse-wheel tuning remains active over the frequency display and tuning strip.
 
 For read-only audio diagnostics (no streams, microphone recording, CAT or PTT):
 
@@ -378,7 +378,7 @@ cmake --build build --target GuiChecks
 .\build\GuiChecks.exe
 ```
 
-These checks cover pending versus confirmed VFO/mode/frequency/gain, command failure recovery, delayed capability discovery, typed drafts, synchronized PTT buttons, the base dashboard pages, small-window scrolling, 100/125/150/200 percent font scales, and command acknowledgements using Hamlib Dummy. They do not exercise live FT-710 RF-scope capture or real radio audio.
+These checks cover pending versus confirmed VFO/mode/frequency/gain, command failure recovery, delayed capability discovery, typed drafts, synchronized PTT buttons, the base dashboard pages, small-window fitting, 100/125/150/200 percent font scales, and command acknowledgements using Hamlib Dummy. They do not exercise live FT-710 RF-scope capture or real radio audio.
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_RADIO_CHECKS=ON
@@ -409,7 +409,7 @@ This dashboard uses the work of the following projects and authors. Credits belo
 | [PortAudio 19.7.0](https://github.com/PortAudio/portaudio) | **Ross Bencina** and **Phil Burk**; Windows WDM-KS work by **Andrew Baldwin** and **Robert Bielik**; WASAPI work by **David Viens** and **Dmitry Kostjuchenko**, plus upstream contributors | **MIT-style PortAudio permission notice**. Statically linked; `licenses/portaudio/` includes the licence and per-file source attribution/permission notices. |
 | [FTDI D2XX](https://ftdichip.com/drivers/d2xx-drivers/) and [LibFT4222](https://ftdichip.com/software-examples/ft4222h-software-examples/) | **Future Technology Devices International Limited (FTDI)** | Optional RF-capture libraries, **downloaded separately under FTDI's terms**. No FTDI DLLs, drivers or SDK files are bundled. |
 
-For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the full `licenses/` folder with the application. Keep equivalent access to the corresponding LGPL sources; the release provides them in [FT710Dashboard-2.0.7-ThirdPartySources.zip](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.7/FT710Dashboard-2.0.7-ThirdPartySources.zip). The individual upstream licences govern their components; the credits table is a summary, not a replacement for those licences.
+For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the full `licenses/` folder with the application. Keep equivalent access to the corresponding LGPL sources; the release provides them in [FT710Dashboard-2.0.8-ThirdPartySources.zip](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.8/FT710Dashboard-2.0.8-ThirdPartySources.zip). The individual upstream licences govern their components; the credits table is a summary, not a replacement for those licences.
 
 - [Hamlib FT-710 backend](https://github.com/Hamlib/Hamlib/blob/4.7.2/rigs/yaesu/ft710.c)
 - [FTDI D2XX Windows desktop driver package — FTD2XX.dll](https://ftdichip.com/drivers/d2xx-drivers/)
@@ -418,6 +418,10 @@ For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the
 - [Yaesu FT-710 downloads and USB driver](https://yaesu.com/product-detail.aspx?CatName=HF+Transceivers%2FAmplifiers&Model=FT-710)
 
 Physical FT-710 operation needs checking with your connected radio. A successful build or Dummy connection does not verify the USB driver, CAT configuration, firmware behavior, transmitted meter calibration, or standby wake-up on your hardware.
+
+## Desktop fitting in 2.0.8
+
+The native desktop dashboard fits all six pages inside smaller windows automatically. Text, buttons, combo boxes and scope labels share the same scale; frequency click targets use the corresponding coordinate conversion. Scaling responds to window size and monitor DPI independently, including changes in phone/RDP sessions.
 
 ## Transmit readback in 2.0.7
 
