@@ -99,6 +99,9 @@ private:
     Connection connection_;
     std::size_t slowIndex_ = 0;
     std::size_t meterIndex_ = 0;
+    std::size_t controlIndex_ = 0, fastIndex_ = 0;
+    enum class PollStage { FrequencyA, ActiveVfo, Meters, Controls, FrequencyB, ModeA, ModeB, Functions, Slow };
+    PollStage pollStage_ = PollStage::FrequencyA;
     int missed_ = 0;
     bool heldPtt_ = false;
     std::uint64_t catPttOwner_ = 0;
@@ -110,9 +113,11 @@ private:
     void connect(const Connection& connection);
     void disconnect();
     void discover();
-    void poll();
+    bool poll(); // False means a queued command interrupted the scan; resume it next time.
     void pollMeters(bool publishUpdate = true);
-    void pollControls();
+    bool pollControls();
+    bool urgentCommandPending();
+    void resetPoll();
     void read(Setting& setting);
     void write(Setting& setting, const std::string& value);
     void publish();

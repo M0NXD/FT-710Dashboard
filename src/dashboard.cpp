@@ -90,7 +90,7 @@ std::wstring noiseReductionName(const radio::Setting* function, const radio::Set
     if (!function || !function->valid) return L"--";
     if (function->value == "0") return L"Off";
     const int amount = discreteLevel(level, maximum, normalized);
-    return amount < 0 ? L"--" : std::to_wstring(amount);
+    return amount < 0 ? L"On" : std::to_wstring(amount);
 }
 double numberOf(HWND window) {
     auto text = narrow(textOf(window));

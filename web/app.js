@@ -96,7 +96,7 @@ function cycleControlState(name) {
   }
   const dnr=name==='dnr',functionItem=setting(dnr?'func.NR':'func.NB'),level=setting(dnr?'level.NR':'level.NB'),maximum=dnr?15:10;
   if(!functionItem?.valid)return {label:(dnr?'DNR':'NB')+': --',enabled:false,selected:false};
-  const enabled=functionItem.value!=='0',amount=discreteLevel(level,maximum,dnr),label=enabled?(amount<0?'--':String(amount)):'Off';
+  const enabled=functionItem.value!=='0',amount=discreteLevel(level,maximum,dnr),label=enabled?(amount<0?'On':String(amount)):'Off';
   return {label:(dnr?'DNR':'NB')+': '+label,enabled:!!functionItem.writable&&!!level?.valid&&!!level.writable,selected:enabled};
 }
 async function cycleControl(name) {

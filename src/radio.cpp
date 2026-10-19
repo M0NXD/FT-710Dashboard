@@ -33,7 +33,7 @@ bool fast(const Setting& setting) {
          RIG_LEVEL_RFPOWER_METER_WATTS | RIG_LEVEL_SWR | RIG_LEVEL_ALC |
          RIG_LEVEL_COMP_METER |
          RIG_LEVEL_VD_METER | RIG_LEVEL_ID_METER | RIG_LEVEL_AF | RIG_LEVEL_RF |
-         RIG_LEVEL_MICGAIN | RIG_LEVEL_SQL | RIG_LEVEL_IF));
+         RIG_LEVEL_MICGAIN | RIG_LEVEL_SQL | RIG_LEVEL_IF | RIG_LEVEL_NR | RIG_LEVEL_NB | RIG_LEVEL_PREAMP));
 }
 std::string nameFor(const std::string& name) {
     static const std::map<std::string, std::string> names{
@@ -302,9 +302,11 @@ void Worker::run() {
                 nextMeters = Clock::now() + std::chrono::milliseconds(250);
             }
             if (Clock::now() >= nextPoll) {
-                if (rig_ && state_.portOpen) poll();
-                nextPoll = Clock::now() + std::chrono::milliseconds(state_.online ? connection_.pollMs : 2000);
-                nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 250 : 500);
+                const bool complete = !rig_ || !state_.portOpen || poll();
+                // Resume interrupted scans after servicing the queued command.
+                // Restarting at frequency A starves later controls under CAT traffic.
+                nextPoll = complete ? Clock::now() + std::chrono::milliseconds(state_.online ? connection_.pollMs : 2000) : Clock::now();
+                if (complete) nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 250 : 500);
             } else if (Clock::now() >= nextMeters) {
                 if (rig_ && state_.online && !state_.poweredOff) pollMeters();
                 nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 250 : 500);
@@ -330,6 +332,7 @@ void Worker::disconnect() {
     auto generation = state_.generation + 1;
     state_ = Snapshot{};
     state_.generation = generation;
+    resetPoll();
     publish();
 }
 void Worker::connect(const Connection& connection) {
@@ -677,7 +680,7 @@ void Worker::pollMeters(bool publishUpdate) {
     }
     for (auto& s : state_.settings) if (s.kind == Kind::Level && state_.transmitting &&
         (s.mask == RIG_LEVEL_STRENGTH || s.mask == RIG_LEVEL_RAWSTR)) { s.valid = false; s.status = "RX only"; }
-    if (commandPending()) { if (publishUpdate) publish(); return; }
+    if (urgentCommandPending()) { if (publishUpdate) publish(); return; }
     // Prioritize the transmitting meters, avoiding duplicate RM5 requests
     // when the calibrated watts meter is available.
     const std::array<setting_t, 9> levels{RIG_LEVEL_RFPOWER_METER_WATTS, RIG_LEVEL_ALC, RIG_LEVEL_SWR,
@@ -689,7 +692,9 @@ void Worker::pollMeters(bool publishUpdate) {
         if (mask == RIG_LEVEL_RFPOWER_METER_WATTS && it == state_.settings.end())
             it = std::find_if(state_.settings.begin(), state_.settings.end(), [](const Setting& s) { return s.kind == Kind::Level && s.mask == RIG_LEVEL_RFPOWER_METER; });
         if (it != state_.settings.end()) {
-            if (!(state_.transmitting && (mask == RIG_LEVEL_STRENGTH || mask == RIG_LEVEL_RAWSTR))) read(*it);
+            if ((it->txOnly && !state_.transmitting) ||
+                (state_.transmitting && (mask == RIG_LEVEL_STRENGTH || mask == RIG_LEVEL_RAWSTR))) continue;
+            read(*it);
             // Derive the relative output from the same calibrated RM5 read.
             if (it->mask == RIG_LEVEL_RFPOWER_METER_WATTS) for (auto& relative : state_.settings)
                 if (relative.kind == Kind::Level && relative.mask == RIG_LEVEL_RFPOWER_METER) {
@@ -701,24 +706,49 @@ void Worker::pollMeters(bool publishUpdate) {
     }
     if (publishUpdate) publish();
 }
-void Worker::pollControls() {
+bool Worker::urgentCommandPending() {
+    std::lock_guard lock(mutex_);
+    return stopping_ || (heldPtt_ && !state_.releasePending && Clock::now() >= pttDeadline_) ||
+        (state_.releasePending && Clock::now() >= releaseDeadline_) ||
+        std::any_of(commands_.begin(), commands_.end(), [](const Command& command) {
+            if (!command.cat) return true;
+            const auto& name = command.cat->request.name;
+            return name.starts_with("set_") || name == "vfo_op" || name == "__release_client";
+        });
+}
+void Worker::resetPoll() {
+    pollStage_ = PollStage::FrequencyA;
+    controlIndex_ = fastIndex_ = 0;
+}
+bool Worker::pollControls() {
     auto commandPending = [&] {
         std::lock_guard lock(mutex_);
         return stopping_ || !commands_.empty();
     };
-    // These values must be read before their editors become available. Refresh
-    // them before the long capability scan so an active TCP client cannot leave
-    // a focused gain editor empty or showing a value from a previous connection.
-    for (auto mask : {RIG_LEVEL_AF, RIG_LEVEL_RF, RIG_LEVEL_RFPOWER, RIG_LEVEL_MICGAIN, RIG_LEVEL_SQL, RIG_LEVEL_IF}) {
-        if (commandPending()) return;
+    // Read the switch and its amount together, before the capability scan.
+    // Keep the cursor when a CAT client interrupts so NR cannot stay at Off.
+    static constexpr std::array<std::pair<Kind, setting_t>, 11> controls{{
+        {Kind::Function, RIG_FUNC_NR}, {Kind::Level, RIG_LEVEL_NR},
+        {Kind::Function, RIG_FUNC_NB}, {Kind::Level, RIG_LEVEL_NB},
+        {Kind::Level, RIG_LEVEL_PREAMP}, {Kind::Level, RIG_LEVEL_AF},
+        {Kind::Level, RIG_LEVEL_RF}, {Kind::Level, RIG_LEVEL_RFPOWER},
+        {Kind::Level, RIG_LEVEL_MICGAIN}, {Kind::Level, RIG_LEVEL_SQL}, {Kind::Level, RIG_LEVEL_IF}
+    }};
+    while (controlIndex_ < controls.size()) {
+        if (urgentCommandPending()) return false;
+        const auto [kind, mask] = controls[controlIndex_++];
         auto it = std::find_if(state_.settings.begin(), state_.settings.end(), [&](const Setting& s) {
-            return s.kind == Kind::Level && s.mask == mask;
+            return s.kind == kind && s.mask == mask;
         });
         if (it != state_.settings.end() && it->readable &&
             (!state_.transmitting || state_.settingsVfo == RIG_VFO_CURR || mask == RIG_LEVEL_RFPOWER)) read(*it);
+        if (commandPending() && controlIndex_ < controls.size()) return false;
     }
+    controlIndex_ = 0;
+    return true;
 }
 void Worker::markPoweredOff() {
+    resetPoll();
     const bool changed = !state_.poweredOff;
     state_.poweredOff = true; state_.powerKnown = true; state_.online = false; state_.standby = false;
     state_.connectionStatus = "Powered off"; state_.error.clear(); missed_ = 0;
@@ -729,95 +759,135 @@ void Worker::markPoweredOff() {
     for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = "Powered off"; }
     if (changed) log_("Radio powered off. CAT connection retained; Power on is available.");
 }
-void Worker::poll() {
+bool Worker::poll() {
     auto pending = [&] {
         std::lock_guard lock(mutex_);
-        return stopping_ || !commands_.empty() || (heldPtt_ && Clock::now() >= pttDeadline_);
+        return stopping_ || !commands_.empty() ||
+            (heldPtt_ && !state_.releasePending && Clock::now() >= pttDeadline_) ||
+            (state_.releasePending && Clock::now() >= releaseDeadline_);
     };
-    const bool checkedPower = state_.poweredOff || (!state_.online && !state_.powerKnown);
-    if (checkedPower) {
-        powerstat_t power{};
-        const auto result = rig_get_powerstat(rig_, &power);
-        if (result == RIG_OK && power == RIG_POWER_OFF) {
-            if (!state_.poweredOff) markPoweredOff();
-            state_.connectionStatus = "Powered off";
-            publish(); return;
-        }
-        if (state_.poweredOff && (result != RIG_OK || power != RIG_POWER_ON)) { publish(); return; }
-        if (result == RIG_OK && power == RIG_POWER_ON) { state_.poweredOff = false; state_.powerKnown = true; }
-    }
-    freq_t frequency = 0;
-    auto result = rig_get_freq(rig_, RIG_VFO_A, &frequency);
-    if (result != RIG_OK) {
-        const auto details = "Frequency read: " + safe(rigerror(result));
-        // A frequency request does not work in standby. Check PS before
-        // publishing an error, including when the front-panel power changed.
-        powerstat_t power{};
-        if (result == -RIG_EPOWER || (!checkedPower && rig_get_powerstat(rig_, &power) == RIG_OK && power == RIG_POWER_OFF)) {
-            markPoweredOff(); publish(); return;
-        }
-        ++missed_;
-        state_.online = false;
-        state_.standby = connection_.type == ConnectionType::Serial && result == -RIG_ETIMEOUT;
-        state_.connectionStatus = state_.standby ? "Powered off" : "No CAT response";
-        if (state_.standby) {
-            state_.powerKnown = false;
+    if (urgentCommandPending()) return false;
+    // Resume at the next transaction instead of repeating the first queries.
+    // Each yield still gives queued PTT, tuning and other writes priority.
+    for (;;) {
+        if (state_.transmitting && pollStage_ >= PollStage::Controls) { resetPoll(); publish(); return true; }
+        switch (pollStage_) {
+        case PollStage::FrequencyA: {
+            const bool checkedPower = state_.poweredOff || (!state_.online && !state_.powerKnown);
+            if (checkedPower) {
+                powerstat_t power{};
+                const auto result = rig_get_powerstat(rig_, &power);
+                if (result == RIG_OK && power == RIG_POWER_OFF) {
+                    if (!state_.poweredOff) markPoweredOff();
+                    state_.connectionStatus = "Powered off";
+                    resetPoll(); publish(); return true;
+                }
+                if (state_.poweredOff && (result != RIG_OK || power != RIG_POWER_ON)) { resetPoll(); publish(); return true; }
+                if (result == RIG_OK && power == RIG_POWER_ON) { state_.poweredOff = false; state_.powerKnown = true; }
+            }
+            freq_t frequency = 0;
+            auto result = rig_get_freq(rig_, RIG_VFO_A, &frequency);
+            if (result != RIG_OK) {
+                const auto details = "Frequency read: " + safe(rigerror(result));
+                // A frequency request does not work in standby. Check PS before
+                // publishing an error, including when the front-panel power changed.
+                powerstat_t power{};
+                if (result == -RIG_EPOWER || (!checkedPower && rig_get_powerstat(rig_, &power) == RIG_OK && power == RIG_POWER_OFF)) {
+                    markPoweredOff(); publish(); return true;
+                }
+                ++missed_;
+                state_.online = false;
+                state_.standby = connection_.type == ConnectionType::Serial && result == -RIG_ETIMEOUT;
+                state_.connectionStatus = state_.standby ? "Powered off" : "No CAT response";
+                if (state_.standby) {
+                    state_.powerKnown = false;
+                    if (state_.error.starts_with("Frequency read:")) state_.error.clear();
+                } else state_.error = "Frequency read: " + briefError(result);
+                state_.a.frequencyValid = state_.b.frequencyValid = false;
+                state_.a.modeValid = state_.b.modeValid = false;
+                state_.pttKnown = false;
+                for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = state_.standby ? "Powered off" : "Stale / no response"; }
+                if (missed_ == 1) {
+                    log_(details);
+                    log_(state_.standby ? "Powered off / silent CAT standby. Connection retained; polling continues and Power on is available." : "Power on remains available while the CAT port is open.");
+                }
+                resetPoll(); publish();
+                return true;
+            }
+            missed_ = 0;
             if (state_.error.starts_with("Frequency read:")) state_.error.clear();
-        } else state_.error = "Frequency read: " + briefError(result);
-        state_.a.frequencyValid = state_.b.frequencyValid = false;
-        state_.a.modeValid = state_.b.modeValid = false;
-        state_.pttKnown = false;
-        for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = state_.standby ? "Powered off" : "Stale / no response"; }
-        if (missed_ == 1) {
-            log_(details);
-            log_(state_.standby ? "Powered off / silent CAT standby. Connection retained; polling continues and Power on is available." : "Power on remains available while the CAT port is open.");
+            state_.online = true;
+            state_.standby = false; state_.poweredOff = false;
+            state_.powerKnown = true;
+            state_.connectionStatus = state_.demo ? "DEMO / Hamlib Dummy" : "Connected / live CAT";
+            state_.lastContact = Clock::now();
+            state_.a.frequency = frequency; state_.a.frequencyValid = true;
+            pollStage_ = PollStage::ActiveVfo;
+            break;
         }
-        publish();
-        return;
+        case PollStage::ActiveVfo: {
+            vfo_t active{};
+            if (rig_get_vfo(rig_, &active) == RIG_OK) state_.activeVfo = active;
+            pollStage_ = PollStage::Meters;
+            break;
+        }
+        case PollStage::Meters:
+            pollMeters(false);
+            pollStage_ = PollStage::Controls;
+            break;
+        case PollStage::Controls:
+            if (!pollControls()) { publish(); return false; }
+            pollStage_ = PollStage::FrequencyB;
+            break;
+        case PollStage::FrequencyB:
+            state_.b.frequencyValid = rig_get_freq(rig_, RIG_VFO_B, &state_.b.frequency) == RIG_OK;
+            pollStage_ = PollStage::ModeA;
+            break;
+        case PollStage::ModeA: {
+            rmode_t mode{}; pbwidth_t width{};
+            state_.a.modeValid = rig_get_mode(rig_, RIG_VFO_A, &mode, &width) == RIG_OK;
+            if (state_.a.modeValid) { state_.a.mode = safe(rig_strrmode(mode)); state_.a.width = width; }
+            pollStage_ = PollStage::ModeB;
+            break;
+        }
+        case PollStage::ModeB: {
+            rmode_t mode{}; pbwidth_t width{};
+            state_.b.modeValid = rig_get_mode(rig_, RIG_VFO_B, &mode, &width) == RIG_OK;
+            if (state_.b.modeValid) { state_.b.mode = safe(rig_strrmode(mode)); state_.b.width = width; }
+            pollStage_ = PollStage::Functions;
+            break;
+        }
+        case PollStage::Functions:
+            while (fastIndex_ < state_.settings.size()) {
+                if (urgentCommandPending()) { publish(); return false; }
+                auto& s = state_.settings[fastIndex_++];
+                if (!fast(s) || (s.kind == Kind::Function && (s.mask == RIG_FUNC_NR || s.mask == RIG_FUNC_NB)) ||
+                    (s.kind == Kind::Level &&
+                     (isMeter(s.mask) || s.mask == RIG_LEVEL_RFPOWER || s.mask == RIG_LEVEL_AF || s.mask == RIG_LEVEL_RF ||
+                      s.mask == RIG_LEVEL_MICGAIN || s.mask == RIG_LEVEL_SQL || s.mask == RIG_LEVEL_IF ||
+                      s.mask == RIG_LEVEL_NR || s.mask == RIG_LEVEL_NB || s.mask == RIG_LEVEL_PREAMP))) continue;
+                read(s);
+                if (pending()) { publish(); return false; }
+            }
+            fastIndex_ = 0;
+            pollStage_ = PollStage::Slow;
+            break;
+        case PollStage::Slow: {
+            // Keep slow scans bounded so one large capability table cannot block UI commands.
+            auto deadline = Clock::now() + std::chrono::milliseconds(160);
+            for (int count = 0; count < 4 && !state_.settings.empty(); ++count) {
+                if (urgentCommandPending()) { publish(); return false; }
+                auto& s = state_.settings[slowIndex_++ % state_.settings.size()];
+                if (!fast(s) && s.kind != Kind::Configuration && !(s.kind == Kind::Level && isMeter(s.mask))) read(s);
+                { std::lock_guard lock(mutex_); if (!commands_.empty() || stopping_) break; }
+                if (Clock::now() > deadline) break;
+            }
+            resetPoll(); publish();
+            return true;
+        }
+        }
+        if (pending()) { publish(); return false; }
     }
-    missed_ = 0;
-    if (state_.error.starts_with("Frequency read:")) state_.error.clear();
-    state_.online = true;
-    state_.standby = false; state_.poweredOff = false;
-    state_.powerKnown = true;
-    state_.connectionStatus = state_.demo ? "DEMO / Hamlib Dummy" : "Connected / live CAT";
-    state_.lastContact = Clock::now();
-    state_.a.frequency = frequency; state_.a.frequencyValid = true;
-    if (pending()) { publish(); return; }
-    vfo_t active{};
-    if (rig_get_vfo(rig_, &active) == RIG_OK) state_.activeVfo = active;
-    if (pending()) { publish(); return; }
-    pollMeters(false);
-    if (pending()) { publish(); return; }
-    pollControls();
-    if (pending()) { publish(); return; }
-    state_.b.frequencyValid = rig_get_freq(rig_, RIG_VFO_B, &state_.b.frequency) == RIG_OK;
-    if (pending()) { publish(); return; }
-    rmode_t mode{}; pbwidth_t width{};
-    state_.a.modeValid = rig_get_mode(rig_, RIG_VFO_A, &mode, &width) == RIG_OK;
-    if (state_.a.modeValid) { state_.a.mode = safe(rig_strrmode(mode)); state_.a.width = width; }
-    if (pending()) { publish(); return; }
-    state_.b.modeValid = rig_get_mode(rig_, RIG_VFO_B, &mode, &width) == RIG_OK;
-    if (state_.b.modeValid) { state_.b.mode = safe(rig_strrmode(mode)); state_.b.width = width; }
-    if (pending()) { publish(); return; }
-    // Receive controls and the slow scan may target another VFO through
-    // Hamlib. Leave those scans until RX; meters and PC remain current-VFO.
-    if (state_.transmitting) { publish(); return; }
-    for (auto& s : state_.settings) if (fast(s) && !(s.kind == Kind::Level &&
-        (isMeter(s.mask) || s.mask == RIG_LEVEL_RFPOWER || s.mask == RIG_LEVEL_AF || s.mask == RIG_LEVEL_RF ||
-         s.mask == RIG_LEVEL_MICGAIN || s.mask == RIG_LEVEL_SQL || s.mask == RIG_LEVEL_IF))) {
-        read(s);
-        if (pending()) { publish(); return; }
-    }
-    // Keep slow scans bounded so one large capability table cannot block UI commands.
-    auto deadline = Clock::now() + std::chrono::milliseconds(160);
-    for (int count = 0; count < 4 && !state_.settings.empty(); ++count) {
-        auto& s = state_.settings[slowIndex_++ % state_.settings.size()];
-        if (!fast(s) && s.kind != Kind::Configuration && !(s.kind == Kind::Level && isMeter(s.mask))) read(s);
-        { std::lock_guard lock(mutex_); if (!commands_.empty() || stopping_) break; }
-        if (Clock::now() > deadline) break;
-    }
-    publish();
 }
 int Worker::power(bool on) {
     if (on && (heldPtt_ || catPttOwner_ || state_.releasePending || state_.transmitting)) {
@@ -831,6 +901,7 @@ int Worker::power(bool on) {
     report(on ? "Power on" : "Power off", result);
     state_.busy = false;
     if (result == RIG_OK) {
+        resetPoll();
         state_.poweredOff = !on;
         state_.standby = false;
         state_.powerKnown = true;
@@ -864,10 +935,11 @@ void Worker::execute(const Command& command) {
     }
     if (command.action == Action::SettingsVfo) {
         state_.settingsVfo = command.vfo;
+        resetPoll();
         for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = "Waiting for selected VFO"; }
         slowIndex_ = 0; publish(); return;
     }
-    if (command.action == Action::Refresh) { slowIndex_ = 0; poll(); return; }
+    if (command.action == Action::Refresh) { slowIndex_ = 0; resetPoll(); poll(); return; }
     if (!state_.online || state_.busy) throw std::runtime_error("The radio is not responding. Use Power on or reconnect.");
     int result = -RIG_ENAVAIL;
     switch (command.action) {
