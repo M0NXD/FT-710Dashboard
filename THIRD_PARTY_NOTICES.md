@@ -2,7 +2,7 @@
 
 The Windows x64 release ZIP includes three external runtime DLLs: `libhamlib-4.dll`, `libusb-1.0.dll` and `libwinpthread-1.dll`. Keep this notice and the `licenses/` directory with the application when redistributing the package. The individual components retain their upstream licences and copyrights. No endorsement by their authors is implied.
 
-The separate **FT710Dashboard-2.0.6-ThirdPartySources.zip** on the [same GitHub release page](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.6) provides the complete, unmodified Hamlib 4.7.2 and libusb 1.0.24 source archives, including their upstream build files. It also provides the MinGW-w64 13.0.0 and PortAudio 19.7.0 source archives. `DEPENDENCIES.json` in both ZIPs records upstream download URLs, component versions and SHA-256 checksums. These source archives are available without charge and without requiring a binary download.
+The separate **FT710Dashboard-2.0.7-ThirdPartySources.zip** on the [same GitHub release page](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.7) provides the complete, unmodified Hamlib 4.7.2 and libusb 1.0.24 source archives, including their upstream build files. It also provides the MinGW-w64 13.0.0 and PortAudio 19.7.0 source archives. `DEPENDENCIES.json` in both ZIPs records upstream download URLs, component versions and SHA-256 checksums. These source archives are available without charge and without requiring a binary download.
 
 ## Hamlib 4.7.2
 
@@ -54,7 +54,7 @@ The Windows **WDM-KS** implementation credits **Andrew Baldwin** and **Robert Bi
 
 `licenses/portaudio/SOURCE_NOTICES.txt` preserves the original copyright, author, permission and disclaimer comment blocks from the pinned common core, Windows support, skeleton, WASAPI and WDM-KS sources and their public headers. This includes the non-binding requests attached to the upstream permission notices. The same catalogue is included in the source ZIP as `PORTAUDIO_SOURCE_NOTICES.txt`.
 
-The source ZIP contains the unmodified upstream `portaudio-v19.7.0.zip`, from the [PortAudio v19.7.0 tag](https://github.com/PortAudio/portaudio/tree/v19.7.0), plus the dashboard's adapted WDM-KS implementation as `dashboard-portaudio_wdmks.c`. That adaptation is also in [the application source](https://github.com/M0NXD/FT-710Dashboard/blob/v2.0.6/src/portaudio_wdmks.c) and retains its upstream notices.
+The source ZIP contains the unmodified upstream `portaudio-v19.7.0.zip`, from the [PortAudio v19.7.0 tag](https://github.com/PortAudio/portaudio/tree/v19.7.0), plus the dashboard's adapted WDM-KS implementation as `dashboard-portaudio_wdmks.c`. That adaptation is also in [the application source](https://github.com/M0NXD/FT-710Dashboard/blob/v2.0.7/src/portaudio_wdmks.c) and retains its upstream notices.
 
 ## FTDI libraries are obtained separately
 

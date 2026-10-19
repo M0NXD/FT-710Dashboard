@@ -770,7 +770,13 @@ bool Worker::poll() {
     // Resume at the next transaction instead of repeating the first queries.
     // Each yield still gives queued PTT, tuning and other writes priority.
     for (;;) {
-        if (state_.transmitting && pollStage_ >= PollStage::Controls) { resetPoll(); publish(); return true; }
+        // FT-710 frequency/mode queries target A/B directly and must stay live
+        // during TX. Only skip receive controls that can make Hamlib switch VFO.
+        if (state_.transmitting && pollStage_ == PollStage::Controls) {
+            controlIndex_ = 0;
+            pollStage_ = PollStage::FrequencyB;
+        }
+        if (state_.transmitting && pollStage_ >= PollStage::Functions) { resetPoll(); publish(); return true; }
         switch (pollStage_) {
         case PollStage::FrequencyA: {
             const bool checkedPower = state_.poweredOff || (!state_.online && !state_.powerKnown);

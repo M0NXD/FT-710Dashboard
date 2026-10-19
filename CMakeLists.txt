@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FT710Dashboard VERSION 2.0.6 LANGUAGES C CXX RC)
+project(FT710Dashboard VERSION 2.0.7 LANGUAGES C CXX RC)
 include(CTest)
 
 if(NOT WIN32)
