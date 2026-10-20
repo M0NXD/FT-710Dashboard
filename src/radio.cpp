@@ -24,6 +24,14 @@ double numeric(const std::string& text) {
         throw std::invalid_argument("Enter a finite number without units.");
     return value;
 }
+bool changesRadio(const Command& command) {
+    if (command.cat) {
+        const auto& name = command.cat->request.name;
+        return name.starts_with("set_") || name == "vfo_op" || name == "__release_client";
+    }
+    // Keep UI connection/selection changes as barriers as well as writes.
+    return command.action != Action::Refresh && command.action != Action::RawQuery;
+}
 bool fast(const Setting& setting) {
     if (setting.kind == Kind::Function) return (setting.mask &
         (RIG_FUNC_NB | RIG_FUNC_NR | RIG_FUNC_ANF | RIG_FUNC_APF | RIG_FUNC_MON |
@@ -186,33 +194,19 @@ void Worker::submit(Command command) {
         // Release requests have priority over queued UI operations.
         if (command.action == Action::PttOff || command.action == Action::Disconnect)
             commands_.push_front(std::move(command));
-        else if (command.action == Action::PttOn) {
-            // A live CAT client can keep read-only polling commands queued
-            // continuously. PTT must jump ahead of those reads, while still
-            // following every queued command that changes radio state.
-            auto changesRadio = [](const Command& queued) {
-                if (queued.cat) {
-                    const auto& name = queued.cat->request.name;
-                    return name.starts_with("set_") || name == "vfo_op" || name == "__release_client";
-                }
-                switch (queued.action) {
-                case Action::Connect: case Action::Disconnect: case Action::PowerOn: case Action::PowerOff:
-                case Action::Set: case Action::Frequency: case Action::StepFrequency: case Action::Mode:
-                case Action::SelectVfo: case Action::Swap: case Action::CopyAtoB: case Action::PttOn:
-                case Action::PttOff: case Action::RawWrite:
-                    return true;
-                default:
-                    return false;
-                }
-            };
-            auto position = commands_.begin();
-            for (auto it = commands_.begin(); it != commands_.end(); ++it)
-                if (changesRadio(*it)) position = std::next(it);
-            commands_.insert(position, std::move(command));
-        }
+        else if (changesRadio(command)) queueInteractive(std::move(command));
         else commands_.push_back(std::move(command));
     }
     wake_.notify_one();
+}
+void Worker::queueInteractive(Command command) {
+    // Tuning, mode and PTT need the same priority for GUI and NET clients.
+    // Do not overtake another write or a read belonging to this client.
+    auto position = commands_.begin();
+    for (auto it = commands_.begin(); it != commands_.end(); ++it)
+        if (changesRadio(*it) || (command.cat && it->cat && command.cat->request.client == it->cat->request.client))
+            position = std::next(it);
+    commands_.insert(position, std::move(command));
 }
 std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
     auto future = job->reply.get_future();
@@ -223,12 +217,13 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
             CatReply reply; reply.result = stopping_ ? -RIG_EIO : -RIG_ELIMIT;
             job->reply.set_value(std::move(reply)); return future;
         }
-        Command command; command.action = Action::Cat; command.cat = std::move(job);
+        Command command; command.action = Action::Cat; command.cat = std::move(job); command.queuedAt = Clock::now();
         if (release) {
             for (auto& pending : commands_) if (pending.cat && pending.cat->request.client == command.cat->request.client)
                 pending.cat->cancelled = true;
             commands_.push_front(std::move(command));
-        } else commands_.push_back(std::move(command));
+        } else if (changesRadio(command)) queueInteractive(std::move(command));
+        else commands_.push_back(std::move(command));
     }
     wake_.notify_one();
     return future;
@@ -260,12 +255,17 @@ void Worker::run() {
     rig_load_all_backends();
     auto nextPoll = Clock::now();
     auto nextMeters = Clock::now();
+    bool catBurst = false;
+    auto catQuietUntil = Clock::time_point{}, catBurstDeadline = Clock::time_point{};
     while (true) {
         Command command;
         bool hasCommand = false;
         {
             std::unique_lock lock(mutex_);
             auto deadline = std::min(nextPoll, nextMeters);
+            // Let the client send its next setup/readback command before a
+            // background read starts. Never hold a continuous burst over 200 ms.
+            if (catQuietUntil > Clock::now()) deadline = std::max(deadline, catQuietUntil);
             if (heldPtt_ && !state_.releasePending) deadline = std::min(deadline, pttDeadline_);
             if (state_.releasePending) deadline = std::min(deadline, releaseDeadline_);
             wake_.wait_until(lock, deadline, [&] { return stopping_ || !commands_.empty(); });
@@ -284,16 +284,33 @@ void Worker::run() {
             }
             if (hasCommand && command.cat) {
                 CatReply reply;
+                const auto started = Clock::now();
                 try {
                     if (command.cat->cancelled) reply.result = -RIG_ETIMEOUT;
                     else reply = executeCat(command.cat->request);
-                } catch (const std::invalid_argument&) { reply.result = -RIG_EINVAL; }
-                  catch (const std::out_of_range&) { reply.result = -RIG_EINVAL; }
-                  catch (...) { reply.result = -RIG_EINTERNAL; }
+                } catch (const std::invalid_argument& error) {
+                    reply.result = -RIG_EINVAL;
+                    log_("CAT client " + std::to_string(command.cat->request.client) + ": " + command.cat->request.name + ": " + error.what());
+                } catch (const std::out_of_range& error) {
+                    reply.result = -RIG_EINVAL;
+                    log_("CAT client " + std::to_string(command.cat->request.client) + ": " + command.cat->request.name + ": " + error.what());
+                } catch (...) { reply.result = -RIG_EINTERNAL; }
                 bool changed = reply.changed;
                 command.cat->reply.set_value(std::move(reply));
+                const auto finished = Clock::now();
+                const auto queuedMs = std::chrono::duration_cast<std::chrono::milliseconds>(started - command.queuedAt).count();
+                const auto radioMs = std::chrono::duration_cast<std::chrono::milliseconds>(finished - started).count();
+                if (queuedMs + radioMs >= 250 && command.cat->request.name != "__release_client")
+                    log_("CAT client " + std::to_string(command.cat->request.client) + ": " + command.cat->request.name +
+                        " took " + std::to_string(queuedMs + radioMs) + " ms (queue " + std::to_string(queuedMs) +
+                        " ms, radio " + std::to_string(radioMs) + " ms).");
+                if (!catBurst) { catBurst = true; catBurstDeadline = finished + std::chrono::milliseconds(200); }
+                catQuietUntil = std::min(finished + std::chrono::milliseconds(20), catBurstDeadline);
                 if (changed) { nextPoll = Clock::now(); publish(); }
-            } else if (hasCommand) execute(command);
+            } else if (hasCommand) {
+                catBurst = false; catQuietUntil = Clock::time_point{};
+                execute(command);
+            }
             // Keep the PTT acknowledgement path short. The radio command has
             // already returned successfully; defer the next full settings scan
             // until after an initial meter refresh.
@@ -301,6 +318,8 @@ void Worker::run() {
                 nextPoll = Clock::now() + std::chrono::milliseconds(connection_.pollMs);
                 nextMeters = Clock::now() + std::chrono::milliseconds(250);
             }
+            if (Clock::now() < catQuietUntil) continue;
+            catBurst = false;
             if (Clock::now() >= nextPoll) {
                 const bool complete = !rig_ || !state_.portOpen || poll();
                 // Resume interrupted scans after servicing the queued command.

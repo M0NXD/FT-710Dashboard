@@ -1,4 +1,4 @@
-# Third-party sources for FT-710 Dashboard 2.0.8
+# Third-party sources for FT-710 Dashboard 2.0.9
 
 This source package is provided alongside the Windows application ZIP on the same GitHub release page. It contains:
 
@@ -17,6 +17,6 @@ This source package is provided alongside the Windows application ZIP on the sam
 
 The original upstream source archives are preserved as downloaded. Extract them using `tar`, Windows ZIP extraction or an archive utility. The archives include the original licences and per-file copyright notices. For building Hamlib, consult its `README.build-Windows` and `scripts/build-w64.sh`; for libusb, consult its `INSTALL` and `README` files and the included MinGW build files. You may use and modify each component under its included upstream licence.
 
-The dashboard source corresponding to the 2.0.8 executable is available at [the application release tag](https://github.com/M0NXD/FT-710Dashboard/tree/v2.0.8). The application uses replaceable external Hamlib and libusb DLLs; the LGPL permissions are explained in `THIRD_PARTY_NOTICES.md`.
+The dashboard source corresponding to the 2.0.9 executable is available at [the application release tag](https://github.com/M0NXD/FT-710Dashboard/tree/v2.0.9). The application uses replaceable external Hamlib and libusb DLLs; the LGPL permissions are explained in `THIRD_PARTY_NOTICES.md`.
 
 This ZIP contains no FTDI libraries or SDK files. FTDI's download locations are documented in the application README and notices.

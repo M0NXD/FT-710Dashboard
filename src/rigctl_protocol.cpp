@@ -79,7 +79,10 @@ std::string dumpState(RIG* rig, bool modern) {
             << "\nhas_set_conf=0\nhas_get_conf=" << (caps.get_conf != nullptr)
             << "\nhas_power2mW=" << (caps.power2mW != nullptr) << "\nhas_mW2power=" << (caps.mW2power != nullptr)
             << "\nhas_get_ant=" << (caps.get_ant != nullptr) << "\nhas_set_ant=" << (caps.set_ant != nullptr)
-            << "\ntimeout=" << caps.timeout << "\nrig_model=" << caps.rig_model
+            // NET rigctl adds 500 ms to this value. The shared worker may be
+            // finishing another transaction, and mode changes need several
+            // serial exchanges. This is a timeout, not a polling delay.
+            << "\ntimeout=" << std::max(caps.timeout, 5000) << "\nrig_model=" << caps.rig_model
             << "\nrigctld_version=" << rig_version() << '\n';
         if (caps.agc_level_count > 0) {
             out << "agc_levels=";
@@ -143,7 +146,9 @@ CatReply Worker::executeCat(const CatRequest& request) {
     };
     auto widthValue = [&](const std::string& text) {
         int width = integer(text);
-        if (width < 0 || width > 100000) throw std::invalid_argument("Invalid passband");
+        // WSJT-X uses -1 to change mode without changing the filter. Pass the
+        // sentinel through to Hamlib for normal and split-mode operations.
+        if (width < RIG_PASSBAND_NOCHANGE || width > 100000) throw std::invalid_argument("Invalid passband");
         return width;
     };
     if (request.generation != state_.generation || !rig_ || !state_.portOpen || connection_.type == ConnectionType::Network)

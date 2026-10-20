@@ -36,7 +36,9 @@ bool sendAll(SOCKET socket, const std::string& text) {
 class Ft710Fixture {
 public:
     std::atomic<bool> transmitting{true};
-    std::atomic<int> power{50}, vfoWrites{0}, meterReads{0};
+    std::atomic<int> power{50}, vfoWrites{0}, meterReads{0}, filterWrites{0};
+    std::atomic<int> frequencyA{14200000}, frequencyB{7074000};
+    std::atomic<int> activeVfo{0}, split{0};
     std::atomic<char> mode{'2'};
     unsigned port = 0;
     Ft710Fixture() {
@@ -60,6 +62,7 @@ public:
         std::lock_guard lock(mutex_);
         return std::find(commands_.begin(), commands_.end(), command) != commands_.end();
     }
+    std::size_t commandCount() { std::lock_guard lock(mutex_); return commands_.size(); }
 private:
     std::atomic<bool> stopping_{false};
     SOCKET listener_ = INVALID_SOCKET, socket_ = INVALID_SOCKET;
@@ -71,10 +74,22 @@ private:
         if (command == "ID") return "ID0800;";
         if (command == "AI") return "AI0;";
         if (command == "PS") return "PS1;";
-        if (command == "FA") return "FA014200000;";
-        if (command == "FB") return "FB007074000;";
-        if (command == "VS") return "VS0;";
-        if (command.starts_with("VS")) { ++vfoWrites; return {}; }
+        if (command == "FA" || command == "FB") {
+            char value[24]{};
+            std::snprintf(value, sizeof value, "%s%09d;", command.c_str(), command == "FA" ? frequencyA.load() : frequencyB.load());
+            return value;
+        }
+        if (command.size() == 11 && (command.starts_with("FA") || command.starts_with("FB"))) {
+            (command.starts_with("FA") ? frequencyA : frequencyB) = std::stoi(command.substr(2)); return {};
+        }
+        if (command == "IF" || command == "OI") {
+            char value[48]{};
+            std::snprintf(value, sizeof value, "%s001%09d+000000%c00000;", command.c_str(),
+                command == "IF" ? frequencyA.load() : frequencyB.load(), mode.load());
+            return value;
+        }
+        if (command == "VS") return "VS" + std::to_string(activeVfo.load()) + ";";
+        if (command.size() == 3 && command.starts_with("VS")) { ++vfoWrites; activeVfo = command[2] - '0'; return {}; }
         if (command == "TX") return transmitting ? "TX2;" : "TX0;";
         if (command.starts_with("TX")) { transmitting = command != "TX0"; return {}; }
         if (command == "PC") {
@@ -82,8 +97,12 @@ private:
         }
         if (command.starts_with("PC") && command.size() == 5) { power = std::stoi(command.substr(2)); return {}; }
         if (command == "MD0" || command == "MD1") return command + mode.load() + ";";
+        if (command.size() == 4 && (command.starts_with("MD0") || command.starts_with("MD1"))) {
+            mode = command[3]; return {};
+        }
         if (command == "SH0" || command == "SH1") return command + "013;";
         if (command == "NA0" || command == "NA1") return command + "0;";
+        if (command.size() > 3 && (command.starts_with("SH") || command.starts_with("NA"))) { ++filterWrites; return {}; }
         if (command == "SM0" || command == "SM1") return command + "130;";
         if (command == "RM3") { ++meterReads; return "RM3135000;"; } // 10 dB compression
         if (command == "RM4") { ++meterReads; return "RM4032000;"; } // Hamlib ALC 0.5
@@ -91,7 +110,10 @@ private:
         if (command == "RM6") { ++meterReads; return "RM6052000;"; } // SWR 1.5
         if (command == "RM7") { ++meterReads; return "RM7053000;"; } // 5 A
         if (command == "RM8") { ++meterReads; return "RM8192000;"; } // 13.8 V
-        if (command == "ST") return "ST0;";
+        if (command == "ST") return "ST" + std::to_string(split.load()) + ";";
+        if (command.size() == 3 && command.starts_with("ST")) { split = command[2] - '0'; return {}; }
+        if (command == "FT") return "FT" + std::to_string(split ? 1 - activeVfo.load() : activeVfo.load()) + ";";
+        if (command.size() == 3 && command.starts_with("FT")) { split = command[2] - '0' != activeVfo; return {}; }
         if (command == "MG") return "MG050;";
         if (command == "AG0" || command == "AG1" || command == "RG0" || command == "RG1") return command + "128;";
         if (command == "SQ0" || command == "SQ1") return command + "000;";
@@ -132,6 +154,35 @@ public:
     double level(setting_t mask, vfo_t vfo = RIG_VFO_CURR) {
         value_t value{}; check(rig_get_level(rig, vfo, mask, &value), std::string("Get ") + rig_strlevel(mask)); return value.f;
     }
+};
+
+// Send the wire request directly so Hamlib's client-side caches cannot skip it.
+class CatWireClient {
+public:
+    explicit CatWireClient(unsigned port) {
+        socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        require(socket_ != INVALID_SOCKET, "CAT wire socket");
+        DWORD timeout = 5000;
+        setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<char*>(&timeout), sizeof timeout);
+        sockaddr_in address{}; address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); address.sin_port = htons(static_cast<u_short>(port));
+        if (connect(socket_, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0) {
+            closesocket(socket_); throw std::runtime_error("CAT wire connect");
+        }
+    }
+    ~CatWireClient() { closesocket(socket_); }
+    std::string command(const std::string& text) {
+        require(sendAll(socket_, text + "\n"), "CAT wire send");
+        std::string line;
+        for (char ch; line.size() < 4096;) {
+            require(recv(socket_, &ch, 1, 0) == 1, "CAT wire reply");
+            if (ch == '\n') return line;
+            line += ch;
+        }
+        throw std::runtime_error("CAT wire reply too long");
+    }
+private:
+    SOCKET socket_ = INVALID_SOCKET;
 };
 
 int main() {
@@ -178,6 +229,7 @@ int main() {
         require(sharedPort != 0, "Could not start sharing test port");
         {
             SharedClient first(sharedPort), second(sharedPort);
+            require(first.rig->caps->timeout >= 5000, "Sharing timeout does not allow for queued serial work");
             auto a = std::async(std::launch::async, [&] { return first.level(RIG_LEVEL_ALC, RIG_VFO_B); });
             auto b = std::async(std::launch::async, [&] { return second.level(RIG_LEVEL_RFPOWER_METER_WATTS, RIG_VFO_B); });
             expectClose(a.get(), .5, "Shared ALC"); expectClose(b.get(), 50, "Shared RF watts");
@@ -204,6 +256,42 @@ int main() {
         wait([](const auto& s) { auto alc = radio::findSetting(s, "level.ALC"); auto rf = radio::findSetting(s, "level.RFPOWER_METER_WATTS");
             return s.pttKnown && !s.transmitting && alc && !alc->valid && rf && !rf->valid; }, "TX readings did not clear on RX");
         std::cout << "PASS TX meters clear on RX; no latched readings are shown as live\n";
+        server.start(sharedPort, snapshot.generation);
+        {
+            CatWireClient client(sharedPort);
+            require(client.command("\\chk_vfo") == "1", "WSJT-X VFO negotiation");
+            require(client.command("T VFOA 0") == "RPRT 0", "WSJT-X initial PTT release");
+            // An opening NET client sends a sequence of capability queries.
+            // These must not each wait behind another background serial read.
+            require(client.command("\\get_modes").find("PKTUSB") != std::string::npos, "Startup mode capabilities");
+            const auto burstStart = std::chrono::steady_clock::now();
+            for (int i = 0; i < 32; ++i)
+                require(client.command("\\get_modes").find("PKTUSB") != std::string::npos, "Startup capability burst");
+            const auto burstMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - burstStart).count();
+            std::cout << "CAT startup burst: 32 capability replies in " << burstMs << " ms\n";
+            require(burstMs < 1000, "Startup queries blocked behind background polling");
+            const auto serialBefore = fixture.commandCount();
+            const auto trafficDeadline = std::chrono::steady_clock::now() + 1200ms;
+            while (std::chrono::steady_clock::now() < trafficDeadline)
+                require(client.command("\\get_modes").find("PKTUSB") != std::string::npos, "Sustained capability traffic");
+            require(fixture.commandCount() > serialBefore, "CAT burst starved background radio reads");
+            std::cout << "PASS background radio polling progresses during sustained CAT traffic\n";
+            // WS/WSJT-X sends this exact request when entering data mode:
+            // M VFOA PKTUSB -1. The sentinel means retain the radio's filter.
+            require(client.command("M VFOA PKTUSB -1") == "RPRT 0", "WSJT-X data mode with unchanged filter");
+            wait([&](const auto&) { return fixture.saw("MD0C"); }, "Data mode was not sent to the FT-710 backend");
+            require(fixture.mode == 'C', "Data mode not applied");
+            const auto splitReply = client.command("X VFOA PKTUSB -1");
+            require(splitReply == "RPRT 0", "Split mode with unchanged filter: " + splitReply);
+            const auto combinedReply = client.command("K VFOA 14075000 PKTUSB -1");
+            require(combinedReply == "RPRT 0", "Combined split mode with unchanged filter: " + combinedReply);
+            require(client.command("M VFOA PKTUSB -2") == "RPRT -1", "Accepted invalid negative passband");
+            require(client.command("X VFOA PKTUSB -2") == "RPRT -1", "Accepted invalid split passband");
+            require(client.command("K VFOA 14075000 PKTUSB -2") == "RPRT -1", "Accepted invalid combined split passband");
+            require(fixture.filterWrites == 0, "Unchanged-filter request changed the radio's filter");
+            std::cout << "PASS WSJT-X data mode and split requests retain the filter; invalid passbands still rejected\n";
+        }
+        server.stop();
         worker.stop();
         std::cout << "ALL OFFLINE CHECKS PASSED (no physical radio or RF transmission)\n";
         return 0;

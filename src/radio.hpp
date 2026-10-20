@@ -108,6 +108,7 @@ private:
     std::chrono::steady_clock::time_point pttDeadline_{};
     std::chrono::steady_clock::time_point releaseDeadline_{};
     int releaseTransmit(const std::string& reason);
+    void queueInteractive(Command command); // mutex_ held; preserve writes and this client's command order.
     void run();
     void execute(const Command& command);
     void connect(const Connection& connection);

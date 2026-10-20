@@ -1,6 +1,6 @@
 # FT-710 Dashboard — Remote Control for Yaesu FT-710
 
-A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.8** automatically scales the desktop interface to fit smaller windows and phone/RDP screens, retains the DNR and transmit readback fixes, and provides two-way phone audio, with a certificate setup page for Safari and a desktop passcode editor. The Windows release ZIP bundles the required **Hamlib, libusb and threading runtime DLLs**, with their licences and notices. **FTDI DLLs for RF capture are downloaded separately.** The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
+A native Windows C++20 application for **local and remote control of the Yaesu FT-710**. Connect the radio to a Windows station PC by USB, then use the desktop GUI or control the same radio remotely from a phone or browser through the app's authenticated HTTPS interface. Tune frequency and VFO, change mode and radio settings, use PTT, monitor meters, and access audio/RF scopes without connecting the client device to the radio's USB port. The station PC and app must remain running and connected to the radio. Version **2.0.9** improves Hamlib/WSJT-X startup and tuning responsiveness, accepts data-mode requests that retain the current filter, and adds slow-command timings. It retains automatic desktop fitting for smaller windows and phone/RDP screens, DNR and transmit readbacks, two-way phone audio, Safari certificate setup and a desktop passcode editor. The Windows release ZIP bundles the required **Hamlib, libusb and threading runtime DLLs**, with their licences and notices. **FTDI DLLs for RF capture are downloaded separately.** The application dynamically uses Hamlib 4.7.2 and the Yaesu FT-710 driver (model 1049).
 
 ## Remote control at a glance
 
@@ -10,17 +10,17 @@ The dashboard serves its authenticated web interface on port **8888**. Open **We
 
 **Download the Windows x64 release ZIP and extract the whole folder. No separate Hamlib or compiler installation is needed to run that package.** It includes `FT710Dashboard.exe`, `libhamlib-4.dll`, `libusb-1.0.dll`, the matching `libwinpthread-1.dll`, this README, `check-runtime.ps1`, `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the `licenses/` directory. Keep the DLLs beside the executable and retain the notices/licences when copying or redistributing the package.
 
-The [same GitHub release](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.8) provides **FT710Dashboard-2.0.8-ThirdPartySources.zip**, containing the corresponding Hamlib 4.7.2 and libusb 1.0.24 sources, plus MinGW-w64 13.0.0 and PortAudio 19.7.0 sources. See [third-party notices](THIRD_PARTY_NOTICES.md) for provenance, LGPL replacement permissions and licence details. The application uses external, replaceable Hamlib and libusb DLLs.
+The [same GitHub release](https://github.com/M0NXD/FT-710Dashboard/releases/tag/v2.0.9) provides **FT710Dashboard-2.0.9-ThirdPartySources.zip**, containing the corresponding Hamlib 4.7.2 and libusb 1.0.24 sources, plus MinGW-w64 13.0.0 and PortAudio 19.7.0 sources. See [third-party notices](THIRD_PARTY_NOTICES.md) for provenance, LGPL replacement permissions and licence details. The application uses external, replaceable Hamlib and libusb DLLs.
 
 #### Direct downloads and quick setup
 
-1. [Download the dashboard Windows x64 ZIP](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.8/FT710Dashboard-2.0.8-Windows-x64.zip).
+1. [Download the dashboard Windows x64 ZIP](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.9/FT710Dashboard-2.0.9-Windows-x64.zip).
 2. Extract **all files and folders**, then open `FT710Dashboard.exe`. Moving only the executable elsewhere will leave its required DLLs behind.
 3. Install Yaesu's USB COM driver and configure the radio connection as described below. For RF capture, separately install the FTDI driver, obtain the two FTDI DLLs and enable **SCU-LAN10 = ON**; see [FTDI DLLs for RF capture](#ftdi-dlls-for-rf-capture).
 
 If Windows reports a missing entry point or DLL, run `powershell -ExecutionPolicy Bypass -File .\check-runtime.ps1` from the extracted dashboard folder. The helper checks the packaged runtime versions without opening a radio connection.
 
-**Manual downloads are only needed for the standalone EXE, a source build, or replacement runtime files.** These links match the versions used by dashboard 2.0.8:
+**Manual downloads are only needed for the standalone EXE, a source build, or replacement runtime files.** These links match the versions used by dashboard 2.0.9:
 
 | Required component | Direct download | Files to use from the extracted package |
 | --- | --- | --- |
@@ -216,6 +216,15 @@ The serial port and sharing server remain open after a successful **Power off**.
 
 Sharing preferences are saved with the connection preferences. Normal launch still requires **Connect** before anything controls the radio. Demo mode can share Hamlib Dummy and is labelled **DEMO radio** in the sharing row. Screenshot capture disables sharing.
 
+### WSJT-X / WS connection troubleshooting
+
+- Start the dashboard, connect to the FT-710, and wait for **Connected / live CAT** before pressing **Test CAT**. Capability discovery can succeed while the radio is powered off, but WSJT-X needs live VFO/frequency/mode replies to finish connecting.
+- Use **Hamlib NET rigctl**, **127.0.0.1:4532**, and **PTT method: CAT**. Only the dashboard opens the Enhanced USB COM port. Use the numeric loopback address: `localhost` may select IPv6 or another program's listener instead of this IPv4 server.
+- WSJT-X/WS can request data mode with passband **-1** (Hamlib's “leave the filter unchanged” value). Normal mode, split-mode and combined split-frequency/mode commands accept this value; **0** selects the normal filter, and a positive value requests a width in Hz.
+- The sharing handshake advertises at least **5000 ms** for a radio operation. Hamlib NET rigctl adds its own 500 ms network margin. This allows for the shared serial queue and multi-command operations; it does not delay successful replies. A client can still time out if the radio is unresponsive or the queue is overloaded.
+- Frequency, mode and PTT writes have priority over other clients' queued reads, while preserving the order of radio changes and each client's requests. A short, bounded pause between background reads lets a client's startup/readback sequence complete without repeatedly queuing behind the settings scan. Background polling continues under sustained client traffic. Commands taking 250 ms or more record separate queue/radio timings in **Activity / CAT** to help diagnose delays.
+- After a dashboard disconnect/reconnect or CAT sharing restart, press **Retry** / **Test CAT** in the client to establish a new session. Read **Activity / CAT** for sharing-port errors and rejected command details. `RPRT -20` means the radio is powered off; `RPRT -5` is a timeout; `RPRT -1` is an invalid command argument.
+
 ## PTT and audio routing (including RDP from a phone)
 
 Both **PTT on** buttons are toggles: single-click or tap either button once to transmit, then **PTT off** on either button to return to receive. You do not need to hold the button or double-click. The header button works on every tab. PTT stays active when you release the mouse/touch or move focus to another app. **Audio routing → Tap PTT timeout** sets the maximum duration for both buttons (default 180 seconds). A CAT client or manually keyed radio cannot be taken over by dashboard PTT. Disconnect, shutdown, session lock and RDP session disconnect release dashboard-owned PTT. Failed release commands retain ownership and retry, so the UI does not claim release after a CAT error.
@@ -409,7 +418,7 @@ This dashboard uses the work of the following projects and authors. Credits belo
 | [PortAudio 19.7.0](https://github.com/PortAudio/portaudio) | **Ross Bencina** and **Phil Burk**; Windows WDM-KS work by **Andrew Baldwin** and **Robert Bielik**; WASAPI work by **David Viens** and **Dmitry Kostjuchenko**, plus upstream contributors | **MIT-style PortAudio permission notice**. Statically linked; `licenses/portaudio/` includes the licence and per-file source attribution/permission notices. |
 | [FTDI D2XX](https://ftdichip.com/drivers/d2xx-drivers/) and [LibFT4222](https://ftdichip.com/software-examples/ft4222h-software-examples/) | **Future Technology Devices International Limited (FTDI)** | Optional RF-capture libraries, **downloaded separately under FTDI's terms**. No FTDI DLLs, drivers or SDK files are bundled. |
 
-For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the full `licenses/` folder with the application. Keep equivalent access to the corresponding LGPL sources; the release provides them in [FT710Dashboard-2.0.8-ThirdPartySources.zip](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.8/FT710Dashboard-2.0.8-ThirdPartySources.zip). The individual upstream licences govern their components; the credits table is a summary, not a replacement for those licences.
+For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the full `licenses/` folder with the application. Keep equivalent access to the corresponding LGPL sources; the release provides them in [FT710Dashboard-2.0.9-ThirdPartySources.zip](https://github.com/M0NXD/FT-710Dashboard/releases/download/v2.0.9/FT710Dashboard-2.0.9-ThirdPartySources.zip). The individual upstream licences govern their components; the credits table is a summary, not a replacement for those licences.
 
 - [Hamlib FT-710 backend](https://github.com/Hamlib/Hamlib/blob/4.7.2/rigs/yaesu/ft710.c)
 - [FTDI D2XX Windows desktop driver package — FTD2XX.dll](https://ftdichip.com/drivers/d2xx-drivers/)
@@ -418,6 +427,10 @@ For redistribution, retain `THIRD_PARTY_NOTICES.md`, `DEPENDENCIES.json` and the
 - [Yaesu FT-710 downloads and USB driver](https://yaesu.com/product-detail.aspx?CatName=HF+Transceivers%2FAmplifiers&Model=FT-710)
 
 Physical FT-710 operation needs checking with your connected radio. A successful build or Dummy connection does not verify the USB driver, CAT configuration, firmware behavior, transmitted meter calibration, or standby wake-up on your hardware.
+
+## Hamlib startup and tuning in 2.0.9
+
+Hamlib NET clients can change to data mode with passband -1, retaining the current filter. The server advertises a timeout that allows for queued, multi-command serial operations. Frequency, mode and PTT writes can overtake other clients' queued reads while preserving write order and each client's requests. Startup/readback bursts get a short scheduling window, bounded so background polling keeps progressing. Activity / CAT records queue and radio time for commands taking 250 ms or more.
 
 ## Desktop fitting in 2.0.8
 
