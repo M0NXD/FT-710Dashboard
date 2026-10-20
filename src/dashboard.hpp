@@ -53,6 +53,8 @@ private:
     std::array<std::string, 2> requestedModes_;
     std::array<std::uint64_t, 2> pendingFrequency_{}, pendingMode_{};
     std::uint64_t nextUiRequest_ = 0, pendingVfo_ = 0;
+    bool tunerClickPending_ = false;
+    std::uint64_t tunerClickGeneration_ = 0;
     int canvasWidth_ = 1104, canvasHeight_ = 860, scrollX_ = 0, scrollY_ = 0;
     HDWP layoutBatch_ = nullptr;
     std::map<int, unsigned> buttonVisuals_;
@@ -105,6 +107,9 @@ private:
     void log(const std::wstring& text);
     std::uint64_t send(radio::Command command);
     void command(int id, int notification);
+    void cancelTunerClick();
+    void toggleTuner();
+    std::uint64_t startAntennaTune();
     void syncTuningEditors(bool reset = false);
     void selectVfo(vfo_t vfo);
     void tuneBySteps(int steps);

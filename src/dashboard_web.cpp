@@ -146,7 +146,7 @@ void Dashboard::publishWeb(bool urgent) {
         << ",\"standby\":" << boolean(s.standby) << ",\"powerKnown\":" << boolean(s.powerKnown)
         << ",\"contactAge\":" << (s.lastContact == std::chrono::steady_clock::time_point{} ? -1LL : std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s.lastContact).count())
         << ",\"preferencesError\":" << web::json(utf8(preferencesError_))
-        << ",\"canPower\":" << boolean(s.canPower) << ",\"canPtt\":" << boolean(s.canPtt) << ",\"pttKnown\":" << boolean(s.pttKnown)
+        << ",\"canPower\":" << boolean(s.canPower) << ",\"canPtt\":" << boolean(s.canPtt) << ",\"canTune\":" << boolean(s.canTune) << ",\"pttKnown\":" << boolean(s.pttKnown)
         << ",\"transmitting\":" << boolean(s.transmitting) << ",\"dashboardPtt\":" << boolean(s.dashboardPtt)
         << ",\"pttPending\":" << boolean(pttPending_) << ",\"releasePending\":" << boolean(s.releasePending) << ",\"browserOwner\":" << browserPttOwner_ << ",\"micLease\":" << audio::browserAudio().lease()
         << ",\"status\":" << web::json(s.connectionStatus) << ",\"error\":" << web::json(s.error) << ",\"activeVfo\":" << web::json(s.activeVfo == RIG_VFO_B ? "B" : "A")
@@ -319,11 +319,12 @@ void Dashboard::webCommand(const std::shared_ptr<web::Request>& request) {
             else if (action == "settingsVfo") { cmd.action = radio::Action::SettingsVfo; int index = vfo == "A" ? 1 : vfo == "B" ? 2 : 0; SendMessageW(controls_[SettingsVfo],CB_SETCURSEL,index,0); }
             else if (action == "swap") cmd.action = radio::Action::Swap;
             else if (action == "copy") cmd.action = radio::Action::CopyAtoB;
+            else if (action == "tuneAntenna") { revision = startAntennaTune(); }
             else if (action == "refresh") cmd.action = radio::Action::Refresh;
             else if (action == "powerOn" || action == "powerOff") { if (!state_.portOpen || state_.busy || !state_.canPower) throw std::runtime_error("Open a radio connection with power control first"); cmd.action = action == "powerOn" ? radio::Action::PowerOn : radio::Action::PowerOff; if (action == "powerOff") { releasePtt(); stopAudio(); } }
             else if (action == "rawQuery" || action == "rawWrite") { if (selected(controls_[ConnectionKind]) != 0 || state_.demo) throw std::runtime_error("Raw CAT requires direct FT-710 USB CAT"); cmd.action = action == "rawQuery" ? radio::Action::RawQuery : radio::Action::RawWrite; cmd.text = get("text"); }
             else throw std::invalid_argument("Unknown web command");
-            if (action != "vfo") revision = send(std::move(cmd));
+            if (action != "vfo" && action != "tuneAntenna") revision = send(std::move(cmd));
         }
         if (!preferencesError_.empty() && (action == "audioLevel" || action == "pttLimit" || action == "unattended" || action == "sharing" || action == "audioMap" || action == "audioRoute"))
             throw std::runtime_error(utf8(preferencesError_));

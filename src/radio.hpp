@@ -50,7 +50,7 @@ struct Snapshot {
     // A silent direct CAT connection uses the standby display without
     // inventing a confirmed power state or discarding PTT release ownership.
     bool standby = false;
-    bool canPower = false, canPtt = false;
+    bool canPower = false, canPtt = false, canTune = false;
     bool dashboardPtt = false;
     bool releasePending = false;
     std::string connectionStatus = "Disconnected", model = "Yaesu FT-710", endpoint, error;
@@ -64,7 +64,7 @@ struct Snapshot {
     std::uint64_t vfoRevision = 0;
     std::map<std::string, std::uint64_t> settingRevision;
 };
-enum class Action { Connect, Disconnect, PowerOn, PowerOff, Set, Frequency, StepFrequency, Mode, SelectVfo, Swap, CopyAtoB, PttOn, PttOff, Refresh, SettingsVfo, RawQuery, RawWrite, Cat };
+enum class Action { Connect, Disconnect, PowerOn, PowerOff, Set, Frequency, StepFrequency, Mode, SelectVfo, Swap, CopyAtoB, TuneAntenna, PttOn, PttOff, Refresh, SettingsVfo, RawQuery, RawWrite, Cat };
 struct Command {
     Action action = Action::Refresh;
     Connection connection;

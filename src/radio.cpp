@@ -418,6 +418,7 @@ void Worker::connect(const Connection& connection) {
     }
     state_.canPower = rig_->caps->set_powerstat != nullptr;
     state_.canPtt = rig_->caps->set_ptt != nullptr;
+    state_.canTune = rig_->caps->vfo_op && (rig_->caps->vfo_ops & RIG_OP_TUNE);
     state_.model = state_.demo ? "Hamlib Dummy / demo" : "Yaesu FT-710";
     if (state_.demo) {
         rig_set_freq(rig_, RIG_VFO_A, 14200000);
@@ -1009,6 +1010,20 @@ void Worker::execute(const Command& command) {
         break;
     case Action::Swap: result = rig_vfo_op(rig_, RIG_VFO_CURR, RIG_OP_XCHG); break;
     case Action::CopyAtoB: result = rig_vfo_op(rig_, RIG_VFO_CURR, RIG_OP_CPY); break;
+    case Action::TuneAntenna: {
+        if (!state_.canTune) throw std::runtime_error("This radio driver does not support an antenna tuning cycle.");
+        if (heldPtt_ || catPttOwner_ || state_.releasePending)
+            throw std::runtime_error("Release PTT before starting the antenna tuning cycle.");
+        ptt_t ptt{};
+        const int status = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt);
+        if (status != RIG_OK) throw std::runtime_error("Cannot read TX status; antenna tuning was not started.");
+        if (ptt != RIG_PTT_OFF) throw std::runtime_error("The radio is transmitting; release PTT before antenna tuning.");
+        // FT-710's Hamlib TUNE operation sends AC003;. The radio controls
+        // its own tuning carrier and ends the cycle; dashboard PTT stays off.
+        result = rig_vfo_op(rig_, RIG_VFO_CURR, RIG_OP_TUNE);
+        resetPoll(); // Read actual TX/meters before any receive-control scan.
+        break;
+    }
     case Action::PttOn:
         {
             auto queueMs = command.queuedAt == Clock::time_point{} ? 0LL :
@@ -1055,7 +1070,8 @@ void Worker::execute(const Command& command) {
     }
     report(command.action == Action::Frequency ? "Tune " + std::string(rig_strvfo(command.vfo)) + " to " + formatNumber(command.number / 1e6) + " MHz" :
         command.action == Action::StepFrequency ? "Tune " + std::string(rig_strvfo(command.vfo)) + " by " + formatNumber(command.number) + " Hz" :
-        command.action == Action::Mode ? "Set mode " + command.text : command.action == Action::PttOn ? "Dashboard PTT on" : "Radio command", result);
+        command.action == Action::Mode ? "Set mode " + command.text : command.action == Action::TuneAntenna ? "Start antenna tuning cycle" :
+        command.action == Action::PttOn ? "Dashboard PTT on" : "Radio command", result);
     if (command.action == Action::PttOn) {
         if (result == RIG_OK) {
             state_.pttKnown = true;

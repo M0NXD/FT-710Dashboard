@@ -4,6 +4,7 @@ let state, socket, client = 0, sequence = 0, closing = false, reconnectTimer, re
 let audioContext, audioSetup, audioNode, listeningGain, micStream, micSource, listening = false, microphone = false, expectedAudio;
 let audioEpoch = 0, microphoneBusy = false, listeningBusy = false, rfCaptureAction = '', rfCaptureTimer, rfCaptureBaselineStatus = '';
 let preferenceSaver, tuningQueue, activePage='dashboard', renderScheduled=false, renderCost=0, lastCommandMs=0, micRegistered=false;
+let tunerClickTimer=0, tunerClickGeneration=0;
 const rfHistory=new RfHistory(), waterfallCaches=new Map();
 const browserMicAvailable=()=>!!(window.isSecureContext&&navigator.mediaDevices?.getUserMedia&&window.AudioWorkletNode);
 const meterSpecs = [
@@ -124,6 +125,29 @@ function updateStickyNavigation(){const header=document.querySelector('.topbar')
 function frequency(hz) { return Math.round(hz).toString().padStart(8,'0').replace(/(\d+)(\d{3})(\d{3})$/,'$1.$2.$3'); }
 function parseFrequencyInput(input){let text=String(input).trim().toLowerCase().replace(/\s+/g,'');let multiplier=0;for(const [unit,scale]of [['mhz',1e6],['khz',1e3],['hz',1]])if(text.endsWith(unit)){text=text.slice(0,-unit.length);multiplier=scale;break;}const separators=(text.match(/[.,]/g)||[]).length;if(separators>1)text=text.replace(/[.,]/g,'');else text=text.replace(',','.');const match=text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))$/);if(!match)throw new Error('Enter a frequency such as 7.074 MHz, 7074 kHz, or 7074000 Hz');const value=Number(match[1]);if(!Number.isFinite(value))throw new Error('Enter a valid radio frequency');if(!multiplier)multiplier=value<=60?1e6:value<=60000?1e3:1;const hz=Math.round(value*multiplier);if(hz<30000||hz>60000000)throw new Error('Frequency must be between 0.030 and 60 MHz');return hz;}
 function band(hz) { for(const [lo,hi,name] of [[1.8e6,2e6,'160 m'],[3.5e6,4e6,'80 m'],[5.25e6,5.45e6,'60 m'],[7e6,7.3e6,'40 m'],[10.1e6,10.15e6,'30 m'],[14e6,14.35e6,'20 m'],[18.068e6,18.168e6,'17 m'],[21e6,21.45e6,'15 m'],[24.89e6,24.99e6,'12 m'],[28e6,29.7e6,'10 m'],[50e6,54e6,'6 m']]) if(hz>=lo&&hz<=hi)return name;return 'General coverage'; }
+function cancelTunerClick(){clearTimeout(tunerClickTimer);tunerClickTimer=0;}
+function toggleTuner(){
+  const item=setting('func.TUNER');
+  if(!state?.online||state.busy||!item?.valid||!item.writable)return;
+  return command('set',{setting:item.id,value:item.value==='0'?'1':'0'});
+}
+async function tunerClick(event){
+  event.preventDefault();
+  if(event.detail===0){cancelTunerClick();return toggleTuner();}
+  if(tunerClickTimer&&tunerClickGeneration===state?.generation){
+    cancelTunerClick();
+    if(!state?.online||state.busy||!state.canTune)throw new Error('Antenna tuning is unavailable');
+    if(!state.pttKnown||state.transmitting||state.dashboardPtt||state.pttPending||state.releasePending)
+      throw new Error('Wait for RX and release PTT before antenna tuning');
+    await command('tuneAntenna');notify('Antenna tuning cycle requested',false);return;
+  }
+  cancelTunerClick();tunerClickGeneration=state?.generation;
+  const generation=tunerClickGeneration;
+  tunerClickTimer=setTimeout(protect(()=>{
+    tunerClickTimer=0;
+    if(!closing&&!document.hidden&&state?.generation===generation)return toggleTuner();
+  }),500);
+}
 function initializeCards() {
   for(const spec of meterSpecs) {
     const card=element('article',undefined,'panel meter-card'), title=element('span',spec[1],'meter-title'), output=element('output','--','meter-value'), bar=element('div',undefined,'meter-bar'), fill=element('i'), note=element('small','No live reading','meter-note');
@@ -135,10 +159,20 @@ function initializeCards() {
     form.addEventListener('submit',protect(async event=>{event.preventDefault();await command('set',{setting:spec[0],value:String(Number(input.value)/spec[2])},input.id);}));
   });
   cycleSpecs.forEach(([name,initial])=>{const button=element('button',initial);button.addEventListener('click',protect(()=>cycleControl(name)));$('functions').append(button);cycleElements.push({name,button});});
-  functionSpecs.forEach(spec=>{const button=element('button',spec[1]);button.addEventListener('click',protect(()=>{const item=setting(spec[0]);return command('set',{setting:spec[0],value:item.value==='0'?'1':'0'});}));$('functions').append(button);functionElements.push(button);});
+  functionSpecs.forEach(spec=>{
+    const button=element('button',spec[1]);
+    if(spec[0]==='func.TUNER'){
+      button.title='Single click: tuner on/off. Double-click or double-tap: start antenna tuning (transmits a tuning carrier).';
+      button.style.touchAction='manipulation';
+      button.addEventListener('click',protect(tunerClick));
+      button.addEventListener('dblclick',event=>event.preventDefault());
+    }else button.addEventListener('click',protect(()=>{const item=setting(spec[0]);return command('set',{setting:spec[0],value:item.value==='0'?'1':'0'});}));
+    $('functions').append(button);functionElements.push(button);
+  });
 }
 function render(next) {
   const previous=state;state=next;const live=state.online&&!state.busy, tx=state.pttKnown&&state.transmitting;
+  if(!live||tunerClickGeneration!==state.generation)cancelTunerClick();
   if(previous && previous.generation!==state.generation) { edits.clear();for(const key of [...dirty])if(!preferenceSaver?.versions.has(key))dirty.delete(key);tuningQueue?.clear();stopClientAudio();scopeRows=[];scopeBins=null;scopePeaks=null;scopeGeneration=-1;rfHistory.clear();rfRows=[];rfBins=null; }
   const off=(state.poweredOff||state.standby)&&!state.busy,status=off?'Powered off':state.status;
   const error=off&&state.error?.startsWith('Frequency read:')?'':state.error;
@@ -229,7 +263,7 @@ async function connectWeb() {
     if(data.type==='error'){notify(data.error);return;}
     if(data.type==='ack'){const waiting=pending.get(data.seq);if(!waiting)return;lastCommandMs=performance.now()-waiting.sent;clearTimeout(waiting.timer);pending.delete(data.seq);const edit=edits.get(waiting.editKey);if(data.ok){if(edit?.seq===data.seq)edit.revision=data.revision||0;waiting.resolve(data);}else{if(edit?.seq===data.seq)edits.delete(waiting.editKey);waiting.reject(new Error(data.error));}}
   };
-  socket.onclose=()=>{if(socket!==connection)return;clearInterval(heartbeat);tuningQueue?.clear();stopClientAudio();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}pending.clear();edits.clear();client=0;$('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;setText($('connectionStatus'),'Browser disconnected · readings paused');setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');if(!scopeFrozen){scopeBins=null;scheduleScopes();}if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}};
+  socket.onclose=()=>{if(socket!==connection)return;cancelTunerClick();clearInterval(heartbeat);tuningQueue?.clear();stopClientAudio();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}pending.clear();edits.clear();client=0;$('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;setText($('connectionStatus'),'Browser disconnected · readings paused');setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');if(!scopeFrozen){scopeBins=null;scheduleScopes();}if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}};
   socket.onerror=()=>{};
 }
 function audioSessionType(capturing=false) {
@@ -355,7 +389,7 @@ function tuneRfFromCanvas(event,id){
 }
 function installPageLifecycle(){
   window.addEventListener('resize',scheduleScopes);
-  window.addEventListener('pagehide',()=>{closing=true;clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
+  window.addEventListener('pagehide',()=>{closing=true;cancelTunerClick();clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
   window.addEventListener('pageshow',event=>{if(event.persisted){closing=false;connectWeb();setText($('browserStatus'),'Page restored. Enable listening and arm the microphone again.');}});
 }
 async function exportCsv(){if(!state)return;const cell=value=>'"'+String(value??'').replace(/"/g,'""')+'"',utc=new Date().toISOString();const rows=[['Name','Group','Hamlib ID','Value','Raw value','Access','Range','Status','VFO','UTC']];state.vfos.forEach((vfo,index)=>{const name=index?'B':'A';for(const [field,label,valid,reading]of [['frequency','frequency (Hz)',vfo.frequencyValid,String(vfo.frequency)],['mode','mode / width',vfo.modeValid,vfo.mode+' / '+vfo.width]])rows.push(['VFO '+name+' '+label,'Radio / VFO','VFO'+name+'.'+field,valid?reading:'',valid?reading:'','Read / write','',valid?'Live':'Unavailable',name,utc]);});for(const item of state.settings)rows.push([item.name,item.group,item.id,item.valid?item.display:'',item.valid?item.value:'',item.writable?'Read / write':'Read only',item.range,item.status,state.settingsVfo,utc]);const blob=new Blob(['\ufeff'+rows.map(row=>row.map(cell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=element('a');link.href=url;link.download='FT710-settings.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
@@ -415,14 +449,14 @@ function setup(){
   for(const id of ['rfSpectrumCanvas','rfWaterfallCanvas','mobileRfSpectrumCanvas','mobileRfWaterfallCanvas'])$(id).addEventListener('click',protect(event=>tuneRfFromCanvas(event,id)));
   const savedStep=localStorage.getItem('step');if([...$('step').options].some(option=>option.value===savedStep))$('step').value=savedStep;$('step').addEventListener('change',()=>localStorage.setItem('step',$('step').value));
   $('scopeFreeze').addEventListener('click',()=>{scopeFrozen=!scopeFrozen;setText($('scopeFreeze'),scopeFrozen?'Resume':'Freeze');$('scopeFreeze').classList.toggle('selected',scopeFrozen);drawScope();});$('scopePeak').addEventListener('click',()=>{scopePeakHold=!scopePeakHold;scopePeaks=null;setText($('scopePeak'),'Peak hold: '+(scopePeakHold?'On':'Off'));$('scopePeak').classList.toggle('selected',scopePeakHold);drawScope();});$('scopeClear').addEventListener('click',clearScope);
-  $('logout').addEventListener('click',protect(async()=>{if(state?.browserOwner===client)await command('ptt',{enabled:'0'});closing=true;clearTimeout(reconnectTimer);socket?.close();stopClientAudio();await fetch('/api/logout',{method:'POST'});$('app').hidden=true;$('mobilePttBar').hidden=true;$('login').hidden=false;}));
+  $('logout').addEventListener('click',protect(async()=>{if(state?.browserOwner===client)await command('ptt',{enabled:'0'});closing=true;cancelTunerClick();clearTimeout(reconnectTimer);socket?.close();stopClientAudio();await fetch('/api/logout',{method:'POST'});$('app').hidden=true;$('mobilePttBar').hidden=true;$('login').hidden=false;}));
   const stable=localStorage.getItem('stableAudio');$('stableAudio').checked=stable!=='0';$('stableAudio').disabled=!navigator.audioSession;
   $('stableAudio').addEventListener('change',()=>{localStorage.setItem('stableAudio',$('stableAudio').checked?'1':'0');audioSessionType(microphone);});
   $('resumeAudio').addEventListener('click',protect(async()=>{await ensureAudio();$('resumeAudio').hidden=true;setText($('browserStatus'),'Audio resumed. Arm the microphone again to transmit.');}));
   $('unattended').addEventListener('change',protect(()=>command('unattended',{enabled:$('unattended').checked?'1':'0'})));
   navigator.mediaDevices?.addEventListener?.('devicechange',()=>{browserDevices().catch(()=>{});updateDiagnostics();});
   navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.');});
-  document.addEventListener('visibilitychange',()=>{subscribeScopes();if(document.hidden&&(microphone||microphoneBusy))audioInterrupted('Microphone disarmed while the page was hidden. Arm it again to transmit.');else scheduleScopes();});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelTunerClick();subscribeScopes();if(document.hidden&&(microphone||microphoneBusy))audioInterrupted('Microphone disarmed while the page was hidden. Arm it again to transmit.');else scheduleScopes();});
   installPageLifecycle();
   setInterval(()=>setText($('clock'),new Date().toISOString().slice(11,19)+' UTC'),1000);
   const code=new URLSearchParams(location.hash.slice(1)).get('code');if(code){$('accessCode').value=code;history.replaceState(null,'',location.pathname);}

@@ -36,6 +36,8 @@ const std::vector<std::string> quickIds{"level.AF", "level.RF", "level.RFPOWER",
 const std::vector<std::string> quickLabels{"AF gain (%)", "RF gain (%)", "RF power (W)", "Mic gain (%)", "Squelch (%)", "IF shift (Hz)"};
 const std::vector<std::string> functionIds{"func.ANF", "func.APF", "func.MON", "func.COMP", "func.VOX", "func.LOCK", "func.TUNER"};
 const std::vector<std::wstring> functionLabels{L"Auto notch", L"APF", L"Monitor", L"Processor", L"VOX", L"Dial lock", L"Tuner"};
+const int TunerButton = Function + static_cast<int>(std::find(functionIds.begin(), functionIds.end(), "func.TUNER") - functionIds.begin());
+constexpr UINT_PTR TunerClickTimer = 4;
 std::wstring wide(const std::string& text) {
     if (text.empty()) return {};
     int count = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
@@ -448,6 +450,15 @@ void Dashboard::createControls() {
     }
     button(CyclePreamp, L"Preamp: IPO", 0); button(CycleDnr, L"DNR: Off", 0); button(CycleNb, L"NB: Off", 0);
     for (int i = 0; i < static_cast<int>(functionLabels.size()); ++i) button(Function + i, functionLabels[i].c_str(), 0);
+    HWND tunerTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window_, nullptr, instance_, nullptr);
+    if (tunerTip) {
+        TOOLINFOW tip{}; tip.cbSize = sizeof tip; tip.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        tip.hwnd = window_; tip.uId = reinterpret_cast<UINT_PTR>(controls_[TunerButton]);
+        tip.lpszText = const_cast<wchar_t*>(L"Single click: tuner on/off. Double-click: start antenna tuning (transmits a tuning carrier).");
+        SendMessageW(tunerTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tip));
+        SendMessageW(tunerTip, TTM_SETMAXTIPWIDTH, 0, 360);
+    }
     control(Filter, L"EDIT", L"", ES_AUTOHSCROLL, 1);
     SendMessageW(controls_[Filter], EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Filter by setting, group or Hamlib name"));
     combo(dropdown(SettingsVfo, 1), {L"Current VFO", L"VFO A", L"VFO B"});
@@ -1051,6 +1062,7 @@ bool Dashboard::tuningWheel(WPARAM wp, LPARAM lp) {
 }
 void Dashboard::update(const radio::Snapshot& state) {
     bool generationChanged = renderedGeneration_ != state.generation;
+    if (generationChanged || !state.online || state.busy) cancelTunerClick();
     bool modesChanged = state_.modes != state.modes;
     bool becameOnline = !state_.online && state.online;
     bool settingsVfoChanged = state_.settingsVfo != state.settingsVfo;
@@ -1245,6 +1257,26 @@ void Dashboard::startSharing() {
         sharingError_ = wide(error.what()); log(sharingError_);
     }
 }
+void Dashboard::cancelTunerClick() {
+    KillTimer(window_, TunerClickTimer);
+    tunerClickPending_ = false;
+}
+void Dashboard::toggleTuner() {
+    const auto* setting = radio::findSetting(state_, "func.TUNER");
+    if (!state_.online || state_.busy || !setting || !setting->valid || !setting->writable) return;
+    radio::Command command; command.action = radio::Action::Set; command.id = setting->id;
+    command.text = setting->value == "0" ? "1" : "0";
+    send(std::move(command));
+}
+std::uint64_t Dashboard::startAntennaTune() {
+    cancelTunerClick();
+    if (!state_.online || state_.busy || !state_.canTune)
+        throw std::runtime_error("Connect to a radio with antenna tuning support first.");
+    if (!state_.pttKnown || state_.transmitting || state_.dashboardPtt || pttLatched_ || pttPending_ || state_.releasePending)
+        throw std::runtime_error("Wait for RX and release PTT before antenna tuning.");
+    radio::Command command; command.action = radio::Action::TuneAntenna; command.vfo = RIG_VFO_CURR;
+    return send(std::move(command));
+}
 void Dashboard::command(int id, int notification) {
     if (updating_) return;
     try {
@@ -1368,6 +1400,16 @@ void Dashboard::command(int id, int notification) {
             return;
         }
         if (id >= Function && id < Function + static_cast<int>(functionIds.size())) {
+            if (id == TunerButton) {
+                if (notification == BN_DOUBLECLICKED) startAntennaTune();
+                else if (notification == BN_CLICKED) {
+                    cancelTunerClick();
+                    tunerClickGeneration_ = state_.generation;
+                    tunerClickPending_ = SetTimer(window_, TunerClickTimer, GetDoubleClickTime() + 1, nullptr) != 0;
+                    if (!tunerClickPending_) toggleTuner();
+                }
+                return;
+            }
             const auto* setting = radio::findSetting(state_, functionIds[id - Function]);
             if (setting && setting->valid) {
                 cmd.action = radio::Action::Set; cmd.id = setting->id; cmd.text = setting->value == "0" ? "1" : "0";
@@ -1827,6 +1869,13 @@ void Dashboard::capture() {
     PostMessageW(window_, WM_CLOSE, 0, 0);
 }
 LRESULT CALLBACK Dashboard::buttonProc(HWND window, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
+    if (msg == WM_LBUTTONDBLCLK && GetDlgCtrlID(window) == TunerButton && IsWindowEnabled(window)) {
+        // Consume the second mouse press so its release cannot queue another
+        // single-click toggle after the full tuning request.
+        auto* self = reinterpret_cast<Dashboard*>(data);
+        self->command(TunerButton, BN_DOUBLECLICKED);
+        return 0;
+    }
     if (msg == WM_PRINTCLIENT || (msg == WM_PRINT && (lp & PRF_CLIENT))) {
         // Use the same renderer as normal WM_DRAWITEM. Default button
         // printing can otherwise copy a cached, out-of-date caption.
@@ -1976,6 +2025,12 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == TunerClickTimer) {
+            const bool apply = tunerClickPending_ && tunerClickGeneration_ == state_.generation;
+            cancelTunerClick();
+            if (apply) toggleTuner();
+            return 0;
+        }
         if (wp == 1) {
             updateAudio();
             if (!state_.dashboardPtt && !pttPending_ && !pttLatched_) browserPttOwner_ = 0;
@@ -2022,6 +2077,7 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_CLOSE: {
         closing_ = true;
+        cancelTunerClick();
         releasePtt(); stopAudio(); savePreferences(); WTSUnRegisterSessionNotification(window_);
         audioJobs_.stop(); scopeJobs_.stop();
         if (webServer_) webServer_->stop();
