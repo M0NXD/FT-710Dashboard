@@ -35,12 +35,13 @@ public:
     bool start();
     void stop();
     void requestStop() { stopRequested_ = true; }
+    void requestShutdown() { shuttingDown_ = true; requestStop(); }
     bool latest(Frame& frame) const;
     std::wstring status() const;
     bool running() const { return running_.load(std::memory_order_relaxed); }
 
 private:
-    std::atomic<bool> stopRequested_{false}, running_{false};
+    std::atomic<bool> stopRequested_{false}, running_{false}, shuttingDown_{false};
     mutable std::mutex mutex_;
     std::thread thread_;
     Frame latest_{};

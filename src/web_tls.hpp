@@ -35,6 +35,9 @@ public:
     const std::string& error() const { return error_; }
     bool send(const std::string& data);
     int read(std::string& data, int timeoutMs); // -1 closed, 0 timeout, 1 data.
+    bool beginBufferedWrites();
+    bool flush();
+    std::size_t pendingBytes() const { return outgoing_.size() - outgoingOffset_; }
 private:
     SOCKET socket_;
     CtxtHandle context_{};
@@ -42,6 +45,10 @@ private:
     bool contextReady_ = false, secure_ = false;
     std::string encrypted_;
     std::string error_;
+    bool bufferedWrites_ = false;
+    std::string outgoing_;
+    std::size_t outgoingOffset_ = 0;
+    ULONGLONG writeProgress_ = 0;
     bool rawSend(const char* data, unsigned size);
     int receive(int timeoutMs);
 };

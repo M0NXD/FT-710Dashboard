@@ -26,6 +26,7 @@ public:
     Server(Handler handler, Log log);
     ~Server();
     void start(const std::wstring& certificateFolder, const std::string& accessCode, bool loopbackOnly = false);
+    void requestStop();
     void stop();
     void setAccessCode(const std::string& accessCode);
     std::uint64_t accessRevision() const { return accessRevision_.load(); }

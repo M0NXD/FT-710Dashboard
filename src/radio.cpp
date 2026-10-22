@@ -160,7 +160,7 @@ Worker::Worker(Update update, Log log) : update_(std::move(update)), log_(std::m
     thread_ = std::thread([this] { run(); });
 }
 Worker::~Worker() { stop(); }
-void Worker::stop() {
+void Worker::requestStop() {
     {
         std::lock_guard lock(mutex_); stopping_ = true;
         for (auto& command : commands_) if (command.cat) {
@@ -169,6 +169,9 @@ void Worker::stop() {
         commands_.clear();
     }
     wake_.notify_one();
+}
+void Worker::stop() {
+    requestStop();
     if (thread_.joinable()) thread_.join();
 }
 void Worker::submit(Command command) {

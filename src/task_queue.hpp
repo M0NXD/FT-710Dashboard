@@ -14,9 +14,12 @@ public:
         { std::lock_guard lock(mutex_); if (stopping_) return; jobs_.push_back(std::move(job)); }
         wake_.notify_one();
     }
-    void stop() {
-        { std::lock_guard lock(mutex_); stopping_ = true; }
+    void requestStop(bool discardPending = false) {
+        { std::lock_guard lock(mutex_); stopping_ = true; if (discardPending) jobs_.clear(); }
         wake_.notify_one();
+    }
+    void stop() {
+        requestStop();
         if (thread_.joinable()) thread_.join();
     }
 private:

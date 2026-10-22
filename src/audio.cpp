@@ -122,6 +122,7 @@ Route::Route() { stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
 Route::~Route() { stop(); if (stopEvent_) CloseHandle(stopEvent_); }
 Status Route::status() const { std::lock_guard lock(mutex_); return status_; }
 void Route::gate(bool enabled) {
+    if (shuttingDown_) enabled = false;
     if (gate_.exchange(enabled) != enabled) { ++gateEpoch_; spectrum_.discontinuity(); if (receiveTap_) browserAudio().discontinuity(); }
 }
 void Route::gain(float value) { gain_ = std::clamp(value, 0.0f, 1.0f); }
@@ -133,6 +134,7 @@ void Route::stop() {
 void Route::requestStop() { gate(false); if (stopEvent_) SetEvent(stopEvent_); }
 void Route::start(const std::wstring& source, const std::wstring& destination) {
     stop();
+    if (shuttingDown_) return;
     if (!stopEvent_) throw std::runtime_error("Cannot create the audio stop event.");
     if (source.empty() || destination.empty()) throw std::invalid_argument("Select both audio devices first.");
     ResetEvent(stopEvent_);
@@ -140,6 +142,7 @@ void Route::start(const std::wstring& source, const std::wstring& destination) {
     thread_ = std::thread([this, source, destination] { run(source, destination); });
 }
 void Route::run(std::wstring source, std::wstring destination) {
+    if (shuttingDown_) return;
     if (source.starts_with(L"ks:") || destination.starts_with(L"ks:") || source.starts_with(L"browser:") || destination.starts_with(L"browser:")) { runDirect(std::move(source), std::move(destination)); return; }
     Apartment apartment;
     HANDLE scheduler = nullptr;
@@ -189,7 +192,7 @@ void Route::run(std::wstring source, std::wstring destination) {
         float sourcePeak = 0, destinationPeak = 0;
         auto reported = std::chrono::steady_clock::now();
         HANDLE events[]{stopEvent_, captureEvent.value, renderEvent.value};
-        while (true) {
+        while (!shuttingDown_) {
             DWORD signaled = WaitForMultipleObjects(3, events, FALSE, 100);
             if (signaled == WAIT_OBJECT_0) break;
             if (signaled == WAIT_FAILED) throw std::runtime_error("Audio event wait failed.");
@@ -201,7 +204,7 @@ void Route::run(std::wstring source, std::wstring destination) {
                 check(output->Start(), L"Resume playback");
             }
             UINT32 packet = 0; check(capture->GetNextPacketSize(&packet), L"Read capture availability");
-            while (packet) {
+            while (packet && !shuttingDown_ && WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) {
                 UINT32 count = 0; DWORD captureFlags = 0;
                 check(capture->GetBuffer(&data, &count, &captureFlags, nullptr, nullptr), L"Read source audio");
                 auto samples = reinterpret_cast<const float*>(data);

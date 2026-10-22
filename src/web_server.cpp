@@ -13,6 +13,11 @@
 
 namespace web {
 namespace {
+#ifdef FT710_TEST_WEB_PORT
+constexpr unsigned short WebPort = FT710_TEST_WEB_PORT;
+#else
+constexpr unsigned short WebPort = 8888;
+#endif
 std::string trim(std::string value) {
     auto first = value.find_first_not_of(" \t\r\n"), last = value.find_last_not_of(" \t\r\n");
     return first == std::string::npos ? "" : value.substr(first, last - first + 1);
@@ -76,7 +81,7 @@ bool frame(Stream& stream, unsigned opcode, const std::string& payload) {
     else { packet += 127; for (int shift = 56; shift >= 0; shift -= 8) packet += static_cast<char>(static_cast<std::uint64_t>(payload.size()) >> shift); }
     packet += payload; return stream.send(packet);
 }
-bool validHost(const std::string& host) { return !host.empty() && host.size() < 256 && host.ends_with(":8888") && std::all_of(host.begin(), host.end(), [](unsigned char c) { return std::isalnum(c) || c == '.' || c == ':' || c == '[' || c == ']' || c == '-'; }); }
+bool validHost(const std::string& host) { return !host.empty() && host.size() < 256 && host.ends_with(":" + std::to_string(WebPort)) && std::all_of(host.begin(), host.end(), [](unsigned char c) { return std::isalnum(c) || c == '.' || c == ':' || c == '[' || c == ']' || c == '-'; }); }
 }
 std::string json(const std::string& value) {
     std::string output = "\"";
@@ -114,19 +119,24 @@ void Server::start(const std::wstring& certificateFolder, const std::string& acc
             if (listener_ == INVALID_SOCKET) throw std::runtime_error("Cannot create web socket (Winsock " + std::to_string(WSAGetLastError()) + ")");
         }
         setsockopt(listener_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<char*>(&exclusive), sizeof exclusive);
-        sockaddr_in6 address6{}; address6.sin6_family = AF_INET6; address6.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any; address6.sin6_port = htons(8888);
-        sockaddr_in address4{}; address4.sin_family = AF_INET; address4.sin_addr.s_addr = htonl(loopbackOnly ? INADDR_LOOPBACK : INADDR_ANY); address4.sin_port = htons(8888);
+        sockaddr_in6 address6{}; address6.sin6_family = AF_INET6; address6.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any; address6.sin6_port = htons(WebPort);
+        sockaddr_in address4{}; address4.sin_family = AF_INET; address4.sin_addr.s_addr = htonl(loopbackOnly ? INADDR_LOOPBACK : INADDR_ANY); address4.sin_port = htons(WebPort);
         if (loopbackOnly && dualStack) address6.sin6_addr = in6addr_any;
         // An IPv4 loopback socket avoids dual-stack wildcard exposure in fixtures.
         if (loopbackOnly && dualStack) { closesocket(listener_);listener_=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);dualStack=false;setsockopt(listener_,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<char*>(&exclusive),sizeof exclusive); }
         auto* address = dualStack ? reinterpret_cast<sockaddr*>(&address6) : reinterpret_cast<sockaddr*>(&address4);
-        if (bind(listener_, address, dualStack ? sizeof address6 : sizeof address4) || listen(listener_, 32)) throw std::runtime_error("Cannot listen on port 8888 (Winsock " + std::to_string(WSAGetLastError()) + "). Another dashboard/server may be using it.");
+        if (bind(listener_, address, dualStack ? sizeof address6 : sizeof address4) || listen(listener_, 32)) throw std::runtime_error("Cannot listen on port " + std::to_string(WebPort) + " (Winsock " + std::to_string(WSAGetLastError()) + "). Another dashboard/server may be using it.");
         running_ = true; acceptThread_ = std::thread([this] { acceptLoop(); });
-        log_(std::string("Web dashboard listening on all ") + (dualStack ? "IPv4/IPv6" : "IPv4") + " addresses, HTTPS port 8888. HTTP serves certificate setup only. Use the Web: 8888 button for access details.");
+        log_(std::string("Web dashboard listening on ") + (loopbackOnly ? "loopback" : dualStack ? "all IPv4/IPv6" : "all IPv4") + " addresses, HTTPS port " + std::to_string(WebPort) + ". HTTP serves certificate setup only. Use the Web: 8888 button for access details.");
     } catch (...) { stop(); throw; }
 }
-void Server::stop() {
+void Server::requestStop() {
     running_ = false;
+    std::lock_guard lock(mutex_);
+    for (auto& client : sessions_) if (client->socket != INVALID_SOCKET) shutdown(client->socket, SD_BOTH);
+}
+void Server::stop() {
+    requestStop();
     if (acceptThread_.joinable()) acceptThread_.join();
     if (listener_ != INVALID_SOCKET) { closesocket(listener_); listener_ = INVALID_SOCKET; }
     { std::lock_guard lock(mutex_); for (auto& client : sessions_) if (client->socket != INVALID_SOCKET) shutdown(client->socket, SD_BOTH); }
@@ -175,11 +185,11 @@ void Server::acceptLoop() {
         if (select(0, &readable, nullptr, nullptr, &timeout) > 0 && running_) {
             sockaddr_storage peer{}; int size = sizeof peer; SOCKET socket = accept(listener_, reinterpret_cast<sockaddr*>(&peer), &size);
             if (socket != INVALID_SOCKET) {
-                DWORD timeoutMs = 1000; BOOL noDelay = TRUE;
+                DWORD timeoutMs = 5000; BOOL noDelay = TRUE;
                 setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<char*>(&timeoutMs), sizeof timeoutMs);
                 setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&noDelay), sizeof noDelay);
                 std::lock_guard lock(mutex_);
-                if (sessions_.size() >= 32) closesocket(socket);
+                if (!running_ || sessions_.size() >= 32) closesocket(socket);
                 else {
                     auto client = std::make_unique<Client>(); client->socket = socket; client->id = nextClient_++;
                     char address[INET6_ADDRSTRLEN]{};
@@ -249,8 +259,9 @@ void Server::serve(Client& client) {
             DWORD decodedSize = 0; auto key = headers["sec-websocket-key"];
             if (key.size() != 24 || !CryptStringToBinaryA(key.c_str(), key.size(), CRYPT_STRING_BASE64, nullptr, &decodedSize, nullptr, nullptr) || decodedSize != 16 || clients_ >= 8) throw std::runtime_error("Invalid WebSocket handshake");
             if (stream.send("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + websocketAccept(key) + "\r\n\r\n")) websocket(client, stream, body, cookieToken(headers["cookie"]));
-        } else if (method == "GET" && path == "/api/state") {
+        } else if (method == "GET" && (path == "/api/state" || path == "/api/ping")) {
             if (!authenticated(headers["cookie"])) stream.send(response(401,"application/json","{\"error\":\"Sign in first\"}"));
+            else if (path == "/api/ping") stream.send(response(200,"application/json","{\"ok\":true}"));
             else { std::string state; { std::lock_guard lock(stateMutex_); state = state_; } stream.send(response(200,"application/json",state)); }
         } else if (method == "GET" && (path == "/" || path == "/index.html")) stream.send(response(200,"text/html; charset=utf-8",resource(201),"",headers["host"]));
         else if (method == "GET" && path == "/app.css") stream.send(response(200,"text/css; charset=utf-8",resource(202)));
@@ -266,61 +277,130 @@ void Server::serve(Client& client) {
 }
 void Server::websocket(Client& client, Stream& stream, std::string input, const std::string& token) {
     if (clients_.fetch_add(1) >= 8) { --clients_; frame(stream,8,std::string("\x03\xf0",2)); return; }
-    struct OnClose { std::function<void()> action; ~OnClose() { try { action(); } catch (...) {} } } cleanup{[this,&client] {
+    const auto started = GetTickCount64();
+    std::string reason = "Server stopped";
+    struct OnClose { std::function<void()> action; ~OnClose() { try { action(); } catch (...) {} } } cleanup{[this,&client,&reason,started] {
         --clients_;
         auto gone = std::make_shared<Request>(); gone->client = client.id; gone->fields["action"] = "browserGone"; handler_(std::move(gone));
+        log_("Web browser " + std::to_string(client.id) + " from " + client.peer + " disconnected after " +
+            std::to_string((GetTickCount64() - started) / 1000) + " s: " + reason);
     }};
+    auto send = [&](unsigned opcode, const std::string& payload) {
+        if (frame(stream,opcode,payload)) return true;
+        reason = stream.error().empty() ? "WebSocket write failed" : stream.error();
+        return false;
+    };
+    auto close = [&](unsigned code, const std::string& text) {
+        reason = text;
+        send(8,std::string{static_cast<char>(code >> 8),static_cast<char>(code & 255)} + text);
+    };
+    if (!stream.beginBufferedWrites()) { reason = stream.error(); return; }
+    log_("Web browser " + std::to_string(client.id) + " connected from " + client.peer);
     std::vector<std::pair<std::string,std::future<std::string>>> pending;
     std::uint64_t revision = ~0ULL, urgentRevision = 0, spectrumRevision = 0, rfSpectrumRevision = 0, cursor = 0, epoch = 0;
     const auto accessRevision = accessRevision_.load();
-    bool listening = false, audioScope = false, rfScope = false, alive = true; auto seen = GetTickCount64(), sentState = seen, sentSpectrum = seen, sentRfSpectrum = seen;
-    unsigned commands = 0; auto commandPeriod = seen;
-    std::string previousState;
-    frame(stream,1,"{\"type\":\"hello\",\"client\":" + std::to_string(client.id) + ",\"rate\":48000}");
+    bool listening = false, audioScope = false, rfScope = false, applicationStalled = false;
+    bool alive = send(1,"{\"type\":\"hello\",\"client\":" + std::to_string(client.id) + ",\"rate\":48000}");
+    auto seen = started, applicationSeen = started, sentPing = started, sentState = started, sentSpectrum = started, sentRfSpectrum = started;
+    unsigned commands = 0, fragmentOpcode = 0;
+    auto commandPeriod = started;
+    ULONGLONG bufferedSince = 0;
+    bool bufferedLogged = false;
+    std::string previousState, fragment;
     while (alive && running_) {
         auto now = GetTickCount64();
-        if (now - seen > 15000 || accessRevision != accessRevision_.load() || !authenticated("ft710_tls_session=" + token)) break;
-        int received = stream.read(input, 10); if (received < 0 || input.size() > 131072) break;
+        if (!stream.flush()) { reason = stream.error(); break; }
+        if (accessRevision != accessRevision_.load()) { close(1008,"Station passcode changed"); break; }
+        if (!authenticated("ft710_tls_session=" + token)) { close(1008,"Station session expired"); break; }
+        if (now - seen > 15000) { close(1001,"Browser heartbeat timed out"); break; }
+        // Browser-native ping/pong survives JavaScript rendering pauses. Keep
+        // the separate application deadline for browser-owned PTT/mic safety.
+        if (now - sentPing >= 5000) {
+            if (!send(9,std::to_string(now))) break;
+            sentPing = now;
+        }
+        if (!applicationStalled && now - applicationSeen > 15000) {
+            applicationStalled = true;
+            auto idle = std::make_shared<Request>(); idle->client = client.id; idle->fields["action"] = "browserGone"; handler_(std::move(idle));
+            log_("Web browser " + std::to_string(client.id) + " control heartbeat paused: browser PTT/microphone release requested; receive connection retained.");
+            if (!send(1,"{\"type\":\"controlIdle\"}")) break;
+        }
+        int received = stream.read(input,10);
+        if (received < 0) { reason = stream.error().empty() ? "Browser connection closed" : stream.error(); break; }
+        if (input.size() > 131072) { close(1009,"WebSocket receive buffer exceeded"); break; }
+        now = GetTickCount64();
         while (input.size() >= 2 && alive) {
             auto a = static_cast<unsigned char>(input[0]), b = static_cast<unsigned char>(input[1]);
-            unsigned opcode = a & 15; std::uint64_t length = b & 127; unsigned header = 2;
-            if (!(a & 128) || (a & 112) || !(b & 128) || opcode == 0) { alive = false; break; }
+            unsigned opcode = a & 15; const bool final = (a & 128) != 0;
+            std::uint64_t length = b & 127; unsigned header = 2;
+            if ((a & 112) || !(b & 128) || (opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10) || ((opcode & 8) && !final)) {
+                close(1002,"Invalid WebSocket frame"); alive = false; break;
+            }
             if (length == 126) { if (input.size() < 4) break; length = (static_cast<unsigned char>(input[2]) << 8) | static_cast<unsigned char>(input[3]); header = 4; }
             else if (length == 127) { if (input.size() < 10) break; length = 0; for (unsigned i = 2; i < 10; ++i) length = (length << 8) | static_cast<unsigned char>(input[i]); header = 10; }
-            if (length > 16384 || ((opcode & 8) && length > 125)) { alive = false; break; }
+            if (length > 16384 || ((opcode & 8) && length > 125)) { close(1009,"WebSocket frame too large"); alive = false; break; }
             if (input.size() < header + 4 + length) break;
-            std::string payload = input.substr(header + 4, static_cast<unsigned>(length));
+            std::string payload = input.substr(header + 4,static_cast<unsigned>(length));
             for (unsigned i = 0; i < length; ++i) payload[i] ^= input[header + (i & 3)];
-            input.erase(0, header + 4 + length); seen = now;
-            if (opcode == 8) { frame(stream,8,payload); alive = false; break; }
-            if (opcode == 9) { alive = frame(stream,10,payload); continue; }
+            input.erase(0,header + 4 + length); seen = now;
+            if (opcode == 8) {
+                if (payload.size() == 1) close(1002,"Invalid WebSocket close frame");
+                else { reason = "Browser requested close"; if (payload.size() >= 2) reason += " (" + std::to_string((static_cast<unsigned char>(payload[0]) << 8) | static_cast<unsigned char>(payload[1])) + ")"; send(8,payload); }
+                alive = false; break;
+            }
+            if (opcode == 9) { alive = send(10,payload); continue; }
             if (opcode == 10) continue;
+            if (opcode == 0) {
+                if (!fragmentOpcode) { close(1002,"Unexpected WebSocket continuation"); alive = false; break; }
+                if (fragment.size() + payload.size() > 16384) { close(1009,"WebSocket message too large"); alive = false; break; }
+                fragment += payload;
+                if (!final) continue;
+                opcode = fragmentOpcode; fragmentOpcode = 0; payload = std::move(fragment); fragment.clear();
+            } else {
+                if (fragmentOpcode) { close(1002,"Interleaved WebSocket messages"); alive = false; break; }
+                if (!final) { fragmentOpcode = opcode; fragment = std::move(payload); continue; }
+            }
+            applicationSeen = now; applicationStalled = false;
             if (opcode == 2) {
                 if (payload.size() < 8) continue;
                 std::uint32_t type, lease; std::memcpy(&type,payload.data(),4); std::memcpy(&lease,payload.data() + 4,4);
                 if (type == 3) audio::browserAudio().microphone(client.id,lease,payload.data() + 8,static_cast<unsigned>(payload.size() - 8));
                 continue;
             }
-            if (opcode != 1) { alive = false; break; }
             try {
                 auto fields = form(payload); auto action = fields["action"], seq = fields["seq"];
-                if (action == "heartbeat") continue;
+                if (action == "heartbeat") { alive = send(1,"{\"type\":\"heartbeat\"}"); continue; }
                 if (now - commandPeriod >= 1000) { commandPeriod = now; commands = 0; }
                 if (++commands > 40 || pending.size() >= 16) throw std::runtime_error("Too many pending commands");
-                if (action == "subscribe") { audioScope = fields["audio"] == "1"; rfScope = fields["rf"] == "1"; spectrumRevision = rfSpectrumRevision = ~0ULL; frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
-                if (action == "listen") { listening = fields["enabled"] == "1"; cursor = 0; epoch = ~0ULL; frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
+                if (action == "subscribe") { audioScope = fields["audio"] == "1"; rfScope = fields["rf"] == "1"; spectrumRevision = rfSpectrumRevision = ~0ULL; alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
+                if (action == "listen") { listening = fields["enabled"] == "1"; cursor = 0; epoch = ~0ULL; alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
                 auto request = std::make_shared<Request>(); request->client = client.id; request->accessRevision = accessRevision; request->fields = std::move(fields);
                 pending.emplace_back(seq,request->reply.get_future()); handler_(std::move(request));
             } catch (const std::exception& error) {
                 std::string seq; try { seq = form(payload)["seq"]; } catch (...) {}
-                frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":false,\"error\":" + json(error.what()) + "}");
+                alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":false,\"error\":" + json(error.what()) + "}");
             }
         }
-        for (auto it = pending.begin(); it != pending.end();) {
+        for (auto it = pending.begin(); it != pending.end() && alive;) {
             if (it->second.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                auto reply = it->second.get(); if (!frame(stream,1,"{\"type\":\"ack\",\"seq\":" + json(it->first) + "," + reply + "}")) alive = false;
+                auto reply = it->second.get(); alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(it->first) + "," + reply + "}");
                 it = pending.erase(it);
             } else ++it;
+        }
+        // Do not let scopes/audio build a stale send backlog. Control, native
+        // pongs and application heartbeats continue while telemetry is paused.
+        if (!alive) continue;
+        if (stream.pendingBytes() > 32768) {
+            if (!bufferedSince) bufferedSince = now;
+            if (!bufferedLogged && now - bufferedSince >= 100) {
+                bufferedLogged = true;
+                log_("Web browser " + std::to_string(client.id) + " buffered output: " + std::to_string(stream.pendingBytes()) + " bytes; incoming controls remain active.");
+            }
+            continue;
+        }
+        if (bufferedSince) {
+            if (bufferedLogged) log_("Web browser " + std::to_string(client.id) + " output resumed after " + std::to_string(now - bufferedSince) + " ms of buffering.");
+            bufferedSince = 0; bufferedLogged = false;
         }
         std::string state, spectrum, rfSpectrum;
         { std::lock_guard lock(stateMutex_);
@@ -328,16 +408,17 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
                 state = state_; revision = revision_; urgentRevision = urgentRevision_; sentState = now;
             }
             if (audioScope && spectrumRevision != spectrumRevision_ && now - sentSpectrum >= 90) { if (spectrumTick_ && now - spectrumTick_ < 500) spectrum = spectrum_; spectrumRevision = spectrumRevision_; sentSpectrum = now; }
-            if (rfScope && rfSpectrumRevision != rfSpectrumRevision_ && now - sentRfSpectrum >= 90) { if (rfSpectrumTick_ && now - rfSpectrumTick_ < 500) rfSpectrum = rfSpectrum_; rfSpectrumRevision = rfSpectrumRevision_; sentRfSpectrum = now; }
+            if (rfScope && rfSpectrumRevision != rfSpectrumRevision_ && now - sentRfSpectrum >= 25) { if (rfSpectrumTick_ && now - rfSpectrumTick_ < 500) rfSpectrum = rfSpectrum_; rfSpectrumRevision = rfSpectrumRevision_; sentRfSpectrum = now; }
         }
-        if (!state.empty()) { const auto payload=delta::state(previousState,state);if(!frame(stream,1,payload))alive=false;previousState=std::move(state); }
-        if (!spectrum.empty() && !frame(stream,2,spectrum)) alive = false;
-        if (!rfSpectrum.empty() && !frame(stream,2,rfSpectrum)) alive = false;
-        if (listening) {
+        if (!state.empty()) { const auto payload = delta::state(previousState,state); alive = send(1,payload); previousState = std::move(state); }
+        if (alive && !spectrum.empty()) alive = send(2,spectrum);
+        if (alive && !rfSpectrum.empty()) alive = send(2,rfSpectrum);
+        if (alive && listening) {
             std::vector<char> packet;
-            for (unsigned i = 0; i < 3 && audio::browserAudio().readReceive(cursor,epoch,packet); ++i)
-                if (!frame(stream,2,std::string(packet.begin(),packet.end()))) { alive = false; break; }
+            for (unsigned i = 0; i < 3 && stream.pendingBytes() <= 32768 && audio::browserAudio().readReceive(cursor,epoch,packet); ++i)
+                if (!send(2,std::string(packet.begin(),packet.end()))) { alive = false; break; }
         }
     }
+    stream.flush();
 }
 }

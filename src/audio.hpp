@@ -13,6 +13,8 @@ struct Device { std::wstring id, name; bool input = false, direct = false, remot
 std::vector<Device> devices();
 std::vector<Device> directDevices();
 std::wstring directDeviceIssue();
+// Call after both routes and their management queue have finished.
+void shutdownDriver();
 bool remoteSession();
 std::wstring savedDeviceName(const std::wstring& identity, bool input);
 struct Status {
@@ -28,6 +30,7 @@ public:
     void start(const std::wstring& source, const std::wstring& destination);
     void stop();
     void requestStop();
+    void requestShutdown() { shuttingDown_ = true; requestStop(); }
     void gate(bool enabled);
     void gain(float value);
     Status status() const;
@@ -37,6 +40,7 @@ private:
     HANDLE stopEvent_ = nullptr;
     std::thread thread_;
     std::atomic<bool> gate_{false};
+    std::atomic<bool> shuttingDown_{false};
     std::atomic<unsigned> gateEpoch_{0};
     std::atomic<float> gain_{1};
     mutable std::mutex mutex_;

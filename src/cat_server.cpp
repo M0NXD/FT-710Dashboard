@@ -103,8 +103,14 @@ void CatServer::start(unsigned port, std::uint64_t generation) {
     catch (...) { stop(); throw; }
     log_("CAT sharing listening on 127.0.0.1:" + std::to_string(port) + " (Hamlib / NET rigctl). Multiple clients can connect.");
 }
+void CatServer::requestStop() {
+    running_ = false;
+    std::lock_guard lock(mutex_);
+    for (auto& client : sessions_) if (client->socket != INVALID_SOCKET) shutdown(client->socket, SD_BOTH);
+}
 void CatServer::stop() {
-    bool wasRunning = running_.exchange(false);
+    bool wasRunning = winsock_;
+    requestStop();
     if (acceptThread_.joinable()) acceptThread_.join();
     if (listener_ != INVALID_SOCKET) { closesocket(listener_); listener_ = INVALID_SOCKET; }
     {
@@ -131,7 +137,8 @@ void CatServer::acceptLoop() {
                 BOOL noDelay = TRUE;
                 setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char*>(&noDelay), sizeof noDelay);
                 std::lock_guard lock(mutex_);
-                if (clients_ >= 16) { sendAll(socket, "RPRT -21\n"); closesocket(socket); }
+                if (!running_) closesocket(socket);
+                else if (clients_ >= 16) { sendAll(socket, "RPRT -21\n"); closesocket(socket); }
                 else {
                     auto client = std::make_unique<Client>();
                     client->socket = socket; client->id = nextClient_++;

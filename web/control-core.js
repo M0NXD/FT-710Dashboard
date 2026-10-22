@@ -36,7 +36,8 @@ class RfHistory {
   constructor(limit=2048) { this.limit=limit;this.clear(); }
   clear() { this.rows=[];this.center=0;this.span=0;this.generation=-1;this.sequence=-1;this.received=0; }
   push(center,span,generation,sequence,bins) {
-    if(this.center!==center||this.span!==span||this.generation!==generation)this.clear();
+    // Keep older rows in their original screen positions as the VFO moves.
+    if(this.span!==span||this.generation!==generation)this.clear();
     if(this.sequence===sequence)return false;
     Object.assign(this,{center,span,generation,sequence,received:performance.now()});
     this.rows.unshift(bins);if(this.rows.length>this.limit)this.rows.pop();return true;

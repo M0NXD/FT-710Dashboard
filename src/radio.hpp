@@ -85,6 +85,7 @@ public:
     ~Worker();
     void submit(Command command);
     std::future<CatReply> request(std::shared_ptr<CatJob> job);
+    void requestStop();
     void stop();
 private:
     Update update_;

@@ -38,6 +38,11 @@ const std::vector<std::string> functionIds{"func.ANF", "func.APF", "func.MON", "
 const std::vector<std::wstring> functionLabels{L"Auto notch", L"APF", L"Monitor", L"Processor", L"VOX", L"Dial lock", L"Tuner"};
 const int TunerButton = Function + static_cast<int>(std::find(functionIds.begin(), functionIds.end(), "func.TUNER") - functionIds.begin());
 constexpr UINT_PTR TunerClickTimer = 4;
+constexpr UINT_PTR ShutdownTimer = 5;
+constexpr std::array<const wchar_t*, 9> shutdownStages{
+    L"Stopping controls", L"Releasing PTT and closing radio CAT", L"Closing browser connections",
+    L"Closing shared CAT connections", L"Stopping RF management jobs", L"Closing RF capture",
+    L"Stopping audio management jobs", L"Closing audio routes", L"Closing audio driver"};
 std::wstring wide(const std::string& text) {
     if (text.empty()) return {};
     int count = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
@@ -303,14 +308,62 @@ Dashboard::Dashboard(HINSTANCE instance, bool demo, std::wstring capturePath, in
     }
 }
 Dashboard::~Dashboard() {
-    audioJobs_.stop(); scopeJobs_.stop();
-    stopAudio();
-    rfCapture_.stop();
-    if (webServer_) webServer_->stop();
-    if (catServer_) catServer_->stop();
-    if (worker_) worker_->stop();
+    if (shutdownThread_.joinable()) shutdownThread_.join();
+    else if (!shutdownDone_) { requestServicesStop(); stopServices(); }
     for (HFONT font : {bodyFont_, smallFont_, titleFont_, frequencyFont_, meterFont_}) if (font) DeleteObject(font);
     DeleteObject(backgroundBrush_); DeleteObject(inputBrush_);
+}
+void Dashboard::requestServicesStop() {
+    closing_ = true;
+    receiveWanted_ = microphoneWanted_ = rfCaptureWanted_ = false;
+    browserPttOwner_ = 0; browserMicClients_.clear();
+    // Signal every owner before joining any of them. Route start/stop remains
+    // serialized on audioJobs_; never join its route concurrently on the GUI.
+    receiveAudio_.requestShutdown(); microphoneAudio_.requestShutdown();
+    audio::browserAudio().microphoneOwner(0, false);
+    rfCapture_.requestShutdown();
+    audioJobs_.requestStop(true); scopeJobs_.requestStop(true);
+    if (worker_) worker_->requestStop();
+    if (webServer_) webServer_->requestStop();
+    if (catServer_) catServer_->requestStop();
+}
+void Dashboard::recordShutdownStage(unsigned stage) {
+    shutdownStage_ = stage;
+    // Flush each stage independently so the last entry survives a stuck driver
+    // or a forced Windows termination. No passcodes or device identities.
+    if (!capturePath_.empty() || iniPath_.empty()) return;
+    try {
+        std::ofstream file(std::filesystem::path(iniPath_).parent_path() / L"shutdown.log",
+            stage == 0 ? std::ios::trunc : std::ios::app);
+        file << narrow(utc()) << "  " << narrow(stage < shutdownStages.size() ? shutdownStages[stage] : L"Shutdown complete") << '\n';
+    } catch (...) { /* Diagnostics must never prevent cleanup. */ }
+}
+void Dashboard::stopServices() {
+    recordShutdownStage(0);
+    recordShutdownStage(1); if (worker_) worker_->stop();
+    recordShutdownStage(2); if (webServer_) webServer_->stop();
+    recordShutdownStage(3); if (catServer_) catServer_->stop();
+    recordShutdownStage(4); scopeJobs_.stop();
+    recordShutdownStage(5); rfCapture_.stop();
+    recordShutdownStage(6); audioJobs_.stop();
+    recordShutdownStage(7); receiveAudio_.stop(); microphoneAudio_.stop();
+    recordShutdownStage(8); audio::shutdownDriver();
+    recordShutdownStage(9);
+    shutdownDone_ = true;
+}
+void Dashboard::finishShutdown() {
+    if (!shutdownDone_) return;
+    if (shutdownThread_.joinable()) shutdownThread_.join();
+    KillTimer(window_, ShutdownTimer);
+    // All producers have finished; release queued payloads before the HWND.
+    MSG pending{};
+    while (PeekMessageW(&pending, window_, UpdateMessage, LogMessage, PM_REMOVE)) {
+        if (pending.message == UpdateMessage) delete reinterpret_cast<radio::Snapshot*>(pending.lParam);
+        if (pending.message == LogMessage) delete reinterpret_cast<std::wstring*>(pending.lParam);
+    }
+    while (PeekMessageW(&pending, window_, WebMessage, WebMessage, PM_REMOVE)) delete reinterpret_cast<std::shared_ptr<web::Request>*>(pending.lParam);
+    while (PeekMessageW(&pending, window_, CompletionMessage, CompletionMessage, PM_REMOVE)) delete reinterpret_cast<std::function<void()>*>(pending.lParam);
+    DestroyWindow(window_);
 }
 int Dashboard::scale(int value) const { return static_cast<int>(std::lround(value * uiScale_)); }
 double Dashboard::unscale(int value) const { return value / uiScale_; }
@@ -380,7 +433,7 @@ int Dashboard::run(int show) {
     ShowWindow(window_, capturePath_.empty() && !preview_ ? show : SW_SHOWNOACTIVATE);
     UpdateWindow(window_);
     SetTimer(window_, 1, 250, nullptr);
-    SetTimer(window_, 3, 50, nullptr);
+    SetTimer(window_, 3, 25, nullptr);
     if (demoAtStart_) {
         SendMessageW(controls_[ConnectionKind], CB_SETCURSEL, 2, 0);
         command(ConnectionKind, CBN_SELCHANGE);
@@ -892,10 +945,12 @@ void Dashboard::paint(HDC dc) {
         for (int i = 0; i <= 4; ++i) label(94 + (w - 140) * i / 4 - 48, 535, 96, 18, tick(i), smallFont_, Muted, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         card(dc, r(28, 577, w - 56, h - 650));
         label(48, 583, 210, 24, L"RF WATERFALL  /  newest at top", bodyFont_, Blue);
-        label(270, 584, w - 318, 22, std::to_wstring(rfHistory_.size()) + L" frames retained", smallFont_, Muted, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        label(270, 584, w - 318, 22, L"2× scroll · " + std::to_wstring(rfHistory_.size()) + L" frames retained", smallFont_, Muted, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         RECT waterfall = r(94, 614, w - 140, h - 712);
         fill(dc, waterfall, Background);
-        const int rows = static_cast<int>(std::min<std::size_t>(rfHistory_.size(), static_cast<std::size_t>(std::max<LONG>(0, waterfall.bottom - waterfall.top))));
+        const int rowHeight = std::max(2, scale(2));
+        const int waterfallHeight = std::max<LONG>(0, waterfall.bottom - waterfall.top);
+        const int rows = static_cast<int>(std::min<std::size_t>(rfHistory_.size(), static_cast<std::size_t>((waterfallHeight + rowHeight - 1) / rowHeight)));
         if (rows > 0) {
             const bool changed = rfPixels_.size() != static_cast<std::size_t>(rows) * rf_scope::BinCount || rfPixelSequence_ != rfRenderedSequence_;
             const bool incremental = changed && rfPixelSequence_ + 1 == rfRenderedSequence_ && rfPixels_.size() == static_cast<std::size_t>(rows) * rf_scope::BinCount;
@@ -911,11 +966,12 @@ void Dashboard::paint(HDC dc) {
             rfPixelSequence_ = rfRenderedSequence_;
             BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = static_cast<LONG>(rf_scope::BinCount);
             info.bmiHeader.biHeight = -rows; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
-            // One captured RF frame occupies one display row. New frames are
-            // inserted at the top, moving older frames down until they leave
-            // the visible area at the bottom.
-            StretchDIBits(dc, waterfall.left, waterfall.top, waterfall.right-waterfall.left, rows,
+            // Each real frame advances two logical pixels. Keep the data rows
+            // intact; faster scrolling does not invent extra radio samples.
+            const int oldStretchMode = SetStretchBltMode(dc, COLORONCOLOR);
+            StretchDIBits(dc, waterfall.left, waterfall.top, waterfall.right-waterfall.left, std::min(waterfallHeight, rows * rowHeight),
                 0, 0, static_cast<int>(rf_scope::BinCount), rows, rfPixels_.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+            SetStretchBltMode(dc, oldStretchMode);
         } else drawText(dc, smallFont_, Muted, waterfall, L"Waiting for FT4222 RF scope frames", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         for (int i = 0; i <= 4; ++i) label(94 + (w - 140) * i / 4 - 48, waterfall.bottom + 1, 96, 18, tick(i), smallFont_, Muted, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1046,6 +1102,7 @@ void Dashboard::tuneBySteps(int steps) {
     send(cmd);
 }
 bool Dashboard::tuningWheel(WPARAM wp, LPARAM lp) {
+    if (closing_) return false;
     if (page_ != 0) return false;
     POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
     HWND hit = WindowFromPoint(point);
@@ -1278,7 +1335,7 @@ std::uint64_t Dashboard::startAntennaTune() {
     return send(std::move(command));
 }
 void Dashboard::command(int id, int notification) {
-    if (updating_) return;
+    if (updating_ || closing_) return;
     try {
         radio::Command cmd;
         cmd.vfo = selected(controls_[TuneVfo]) == 1 ? RIG_VFO_B : RIG_VFO_A;
@@ -1527,8 +1584,7 @@ void Dashboard::postUi(std::function<void()> completion) {
 }
 void Dashboard::stopRoute(audio::Route& route) {
     route.requestStop();
-    if (closing_) route.stop();
-    else audioJobs_.submit([&route] { route.stop(); });
+    if (!closing_) audioJobs_.submit([&route] { route.stop(); });
 }
 void Dashboard::applyRfSettings(std::wstring port, unsigned span, unsigned baud, double level, std::shared_ptr<web::Request> request) {
     station_settings::scope({{"rfCat2Port",narrow(port)},{"rfSpan",std::to_string(span)},{"rfCat2Baud",std::to_string(baud)},{"rfWaterfallLevel",std::to_string(level)}},true);
@@ -1705,7 +1761,9 @@ void Dashboard::updateRfScope() {
         rfRenderedSequence_ = next.sequence;
         const auto& active = state_.activeVfo == RIG_VFO_B ? state_.b : state_.a;
         if (!next.frequencyValid && active.frequencyValid) { next.centerHz = static_cast<std::uint64_t>(std::llround(active.frequency)); next.frequencyValid = true; }
-        if (rfFrame_.generation != next.generation || rfFrame_.centerHz != next.centerHz || rfFrame_.spanIndex != next.spanIndex) {
+        // Preserve the tuning trail. Rows retain the screen position they had
+        // when received; only a new span or capture session resets the grid.
+        if (rfFrame_.generation != next.generation || rfFrame_.spanIndex != next.spanIndex) {
             rfHistory_.clear(); rfPixels_.clear();
         }
         rfFrame_ = next;
@@ -1949,6 +2007,7 @@ LRESULT CALLBACK Dashboard::windowProc(HWND window, UINT msg, WPARAM wp, LPARAM 
     return self ? self->handle(msg, wp, lp) : DefWindowProcW(window, msg, wp, lp);
 }
 LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
+    if (closing_ && (msg == WM_COMMAND || msg == WM_WTSSESSION_CHANGE || msg == WM_MOUSEWHEEL || msg == WM_KEYDOWN)) return 0;
     switch (msg) {
     case WM_CREATE: {
         dpi_ = GetDpiForWindow(window_);
@@ -2025,6 +2084,16 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
+        if (wp == ShutdownTimer && closing_) {
+            if (shutdownDone_) finishShutdown();
+            else {
+                const auto stage = std::min<unsigned>(shutdownStage_.load(), shutdownStages.size() - 1);
+                const auto title = std::wstring(L"FT-710 Dashboard | Closing: ") + shutdownStages[stage] + L"…";
+                textIfChanged(window_, title);
+            }
+            return 0;
+        }
+        if (closing_) return 0;
         if (wp == TunerClickTimer) {
             const bool apply = tunerClickPending_ && tunerClickGeneration_ == state_.generation;
             cancelTunerClick();
@@ -2052,14 +2121,17 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         MSG newer{};
         while (PeekMessageW(&newer, window_, UpdateMessage, UpdateMessage, PM_REMOVE))
             state.reset(reinterpret_cast<radio::Snapshot*>(newer.lParam));
-        update(*state); return 0;
+        if (!closing_) update(*state);
+        return 0;
     }
     case LogMessage: {
         std::unique_ptr<std::wstring> text(reinterpret_cast<std::wstring*>(lp)); log(*text); return 0;
     }
     case WebMessage: {
         std::unique_ptr<std::shared_ptr<web::Request>> request(reinterpret_cast<std::shared_ptr<web::Request>*>(lp));
-        webCommand(*request); return 0;
+        if (closing_) (*request)->reply.set_value("\"ok\":false,\"error\":\"Dashboard is closing\"");
+        else webCommand(*request);
+        return 0;
     }
     case CompletionMessage: {
         std::unique_ptr<std::function<void()>> job(reinterpret_cast<std::function<void()>*>(lp));
@@ -2076,22 +2148,17 @@ LRESULT Dashboard::handle(UINT msg, WPARAM wp, LPARAM lp) {
         if ((wp == WTS_REMOTE_CONNECT || wp == WTS_SESSION_UNLOCK) && !unattended_) { stopAudio(); refreshAudioDevices(); }
         return 0;
     case WM_CLOSE: {
-        closing_ = true;
+        if (closing_) return 0;
         cancelTunerClick();
-        releasePtt(); stopAudio(); savePreferences(); WTSUnRegisterSessionNotification(window_);
-        audioJobs_.stop(); scopeJobs_.stop();
-        if (webServer_) webServer_->stop();
-        if (catServer_) catServer_->stop();
-        if (worker_) worker_->stop();
-        // Drain worker-owned payloads before destroying the receiving window.
-        MSG pending{};
-        while (PeekMessageW(&pending, window_, UpdateMessage, LogMessage, PM_REMOVE)) {
-            if (pending.message == UpdateMessage) delete reinterpret_cast<radio::Snapshot*>(pending.lParam);
-            if (pending.message == LogMessage) delete reinterpret_cast<std::wstring*>(pending.lParam);
-        }
-        while (PeekMessageW(&pending, window_, WebMessage, WebMessage, PM_REMOVE)) delete reinterpret_cast<std::shared_ptr<web::Request>*>(pending.lParam);
-        while (PeekMessageW(&pending, window_, CompletionMessage, CompletionMessage, PM_REMOVE)) delete reinterpret_cast<std::function<void()>*>(pending.lParam);
-        DestroyWindow(window_); return 0;
+        releasePtt(); savePreferences(); WTSUnRegisterSessionNotification(window_);
+        requestServicesStop();
+        KillTimer(window_, 1); KillTimer(window_, 2); KillTimer(window_, 3);
+        for (const auto& [id, child] : controls_) { (void)id; EnableWindow(child, FALSE); }
+        SetWindowTextW(window_, L"FT-710 Dashboard | Closing devices…");
+        SetTimer(window_, ShutdownTimer, 200, nullptr);
+        try { shutdownThread_ = std::thread([this] { stopServices(); }); }
+        catch (const std::system_error&) { stopServices(); finishShutdown(); }
+        return 0;
     }
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }

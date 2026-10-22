@@ -13,6 +13,7 @@ public:
     CatServer(Handler handler, Log log);
     ~CatServer();
     void start(unsigned port, std::uint64_t generation);
+    void requestStop();
     void stop();
     bool running() const { return running_.load(); }
     unsigned clients() const { return clients_.load(); }

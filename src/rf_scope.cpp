@@ -124,6 +124,7 @@ std::wstring errorText(const wchar_t* action, std::uint32_t code) {
 Capture::~Capture() { stop(); }
 
 bool Capture::start() {
+    if (shuttingDown_) return false;
     if (running_.load(std::memory_order_relaxed)) return true;
     if (thread_.joinable()) thread_.join();
     stopRequested_.store(false, std::memory_order_relaxed);
@@ -166,6 +167,7 @@ void Capture::setStatus(std::wstring status) {
 }
 
 void Capture::run() {
+    if (shuttingDown_) { running_ = false; return; }
     Ftdi ftdi;
     if (!ftdi.load()) {
         setStatus(L"FTDI libraries missing (FTD2XX.dll and LibFT4222.dll)");
@@ -182,7 +184,7 @@ void Capture::run() {
     setStatus(L"FT4222 RF scope connected · waiting for valid frames");
     std::array<std::uint8_t, FrameBytes> raw{};
     unsigned badFrames = 0;
-    while (!stopRequested_.load(std::memory_order_relaxed)) {
+    while (!stopRequested_.load(std::memory_order_relaxed) && !shuttingDown_) {
         std::uint16_t received = 0;
         bool waiting = false;
         const auto result = ftdi.readFrame(raw, received, waiting);

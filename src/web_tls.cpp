@@ -212,13 +212,57 @@ void Credentials::create(const std::wstring& folder) {
 }
 Stream::~Stream() { if (contextReady_) DeleteSecurityContext(&context_); }
 bool Stream::rawSend(const char* data, unsigned size) {
-    for (unsigned sent = 0; sent < size;) { int count = ::send(socket_, data + sent, size - sent, 0); if (count <= 0) return false; sent += count; } return true;
+    if (bufferedWrites_) {
+        if (pendingBytes() + size > 1024 * 1024) { error_ = "Browser send queue exceeded 1 MiB"; return false; }
+        if (!pendingBytes()) { outgoing_.clear(); outgoingOffset_ = 0; writeProgress_ = GetTickCount64(); }
+        else if (outgoingOffset_ > 65536) { outgoing_.erase(0,outgoingOffset_); outgoingOffset_ = 0; }
+        outgoing_.append(data,size);
+        return flush();
+    }
+    for (unsigned sent = 0; sent < size;) {
+        int count = ::send(socket_, data + sent, size - sent, 0);
+        if (count <= 0) { error_ = "Socket send failed (Winsock " + std::to_string(WSAGetLastError()) + ")"; return false; }
+        sent += count;
+    }
+    return true;
+}
+bool Stream::beginBufferedWrites() {
+    int sendBuffer = 32768;
+    setsockopt(socket_,SOL_SOCKET,SO_SNDBUF,reinterpret_cast<const char*>(&sendBuffer),sizeof sendBuffer);
+    u_long enabled = 1;
+    if (ioctlsocket(socket_,FIONBIO,&enabled) != 0) { error_ = "Cannot enable nonblocking browser writes"; return false; }
+    bufferedWrites_ = true;
+    return true;
+}
+bool Stream::flush() {
+    if (!bufferedWrites_) return true;
+    unsigned budget = 65536;
+    while (pendingBytes() && budget) {
+        const int count = ::send(socket_,outgoing_.data() + outgoingOffset_,static_cast<int>(std::min<std::size_t>(pendingBytes(),budget)),0);
+        if (count > 0) { outgoingOffset_ += count; budget -= count; writeProgress_ = GetTickCount64(); continue; }
+        const int error = WSAGetLastError();
+        if (count < 0 && error == WSAEWOULDBLOCK) break;
+        error_ = "Socket send failed (Winsock " + std::to_string(error) + ")";
+        return false;
+    }
+    if (!pendingBytes()) { outgoing_.clear(); outgoingOffset_ = 0; }
+    else if (GetTickCount64() - writeProgress_ > 5000) { error_ = "Browser stopped accepting data for 5 seconds"; return false; }
+    return true;
 }
 int Stream::receive(int timeoutMs) {
     fd_set readable; FD_ZERO(&readable); FD_SET(socket_, &readable); timeval timeout{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
-    int ready = select(0, &readable, nullptr, nullptr, &timeout); if (ready <= 0) return ready < 0 ? -1 : 0;
-    char buffer[16384]; int bytes = recv(socket_, buffer, sizeof buffer, 0); if (bytes <= 0) return -1;
-    encrypted_.append(buffer, bytes); return encrypted_.size() > 131072 ? -1 : 1;
+    int ready = select(0, &readable, nullptr, nullptr, &timeout);
+    if (ready < 0) { error_ = "Socket wait failed (Winsock " + std::to_string(WSAGetLastError()) + ")"; return -1; }
+    if (!ready) return 0;
+    char buffer[16384]; int bytes = recv(socket_, buffer, sizeof buffer, 0);
+    if (!bytes) { error_ = "Browser closed the TCP connection"; return -1; }
+    if (bytes < 0) {
+        const int error = WSAGetLastError(); if (error == WSAEWOULDBLOCK) return 0;
+        error_ = "Socket receive failed (Winsock " + std::to_string(error) + ")"; return -1;
+    }
+    encrypted_.append(buffer, bytes);
+    if (encrypted_.size() > 131072) { error_ = "TLS receive buffer exceeded its limit"; return -1; }
+    return 1;
 }
 bool Stream::negotiate(Credentials& credentials) {
     auto deadline = GetTickCount64() + 10000;
@@ -264,7 +308,12 @@ int Stream::read(std::string& data, int timeoutMs) {
         SecBuffer buffers[4]{{static_cast<ULONG>(encrypted_.size()), SECBUFFER_DATA, encrypted_.data()}, {0,SECBUFFER_EMPTY,nullptr}, {0,SECBUFFER_EMPTY,nullptr}, {0,SECBUFFER_EMPTY,nullptr}};
         SecBufferDesc message{SECBUFFER_VERSION, 4, buffers}; auto status = DecryptMessage(&context_, &message, 0, nullptr);
         if (status == SEC_E_INCOMPLETE_MESSAGE) { attempted = true; continue; }
-        if (status != SEC_E_OK) return -1; // Close on renegotiation or peer close.
+        if (status != SEC_E_OK) {
+            error_ = status == SEC_I_CONTEXT_EXPIRED ? "Browser closed the TLS connection" :
+                status == SEC_I_RENEGOTIATE ? "Browser requested TLS renegotiation" :
+                "TLS decrypt failed (Schannel " + std::to_string(static_cast<unsigned long>(status)) + ")";
+            return -1;
+        }
         unsigned extra = 0;
         for (const auto& buffer : buffers) {
             if (buffer.BufferType == SECBUFFER_DATA) data.append(static_cast<const char*>(buffer.pvBuffer), buffer.cbBuffer);

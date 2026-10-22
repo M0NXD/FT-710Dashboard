@@ -4,6 +4,8 @@ let state, socket, client = 0, sequence = 0, closing = false, reconnectTimer, re
 let audioContext, audioSetup, audioNode, listeningGain, micStream, micSource, listening = false, microphone = false, expectedAudio;
 let audioEpoch = 0, microphoneBusy = false, listeningBusy = false, rfCaptureAction = '', rfCaptureTimer, rfCaptureBaselineStatus = '';
 let preferenceSaver, tuningQueue, activePage='dashboard', renderScheduled=false, renderCost=0, lastCommandMs=0, micRegistered=false;
+let playbackMicActive=false;
+let connectionTimer,connectionRevision=0,lastDisconnect='None';
 let tunerClickTimer=0, tunerClickGeneration=0;
 const rfHistory=new RfHistory(), waterfallCaches=new Map();
 const browserMicAvailable=()=>!!(window.isSecureContext&&navigator.mediaDevices?.getUserMedia&&window.AudioWorkletNode);
@@ -83,7 +85,7 @@ function scheduleScopes() {
 function updateDiagnostics() {
   if(!$('diagnosticText')||!state)return;
   const rf=state.rfScope||{};
-  setText($('diagnosticText'),`CAT: ${state.connection.endpoint} · last reply ${state.contactAge>=0?(state.contactAge/1000).toFixed(1)+' s ago':'unavailable'}\nRF: ${rf.running?(rf.frameValid?'live':'waiting / stale'):'stopped'} · age ${rf.age>=0?rf.age+' ms':'unavailable'}\nBrowser: ${socket?.readyState===1?'connected':'disconnected'} · command acknowledgement ${lastCommandMs.toFixed(0)} ms\nAudio: ${audioContext?.state||'off'} · session ${navigator.audioSession?.type||'system default'} / ${navigator.audioSession?.state||'unknown'}\nDraw: ${renderCost.toFixed(1)} ms · ${state.audio.refreshing?'refreshing devices':state.audio.receiveText}\nMicrophone: ${microphone?'armed':'disarmed'} · ${state.releasePending?'PTT release retry pending':'PTT release clear'}`);
+  setText($('diagnosticText'),`CAT: ${state.connection.endpoint} · last reply ${state.contactAge>=0?(state.contactAge/1000).toFixed(1)+' s ago':'unavailable'}\nRF: ${rf.running?(rf.frameValid?'live':'waiting / stale'):'stopped'} · age ${rf.age>=0?rf.age+' ms':'unavailable'}\nBrowser: ${socket?.readyState===1?'connected':'disconnected'} · command acknowledgement ${lastCommandMs.toFixed(0)} ms\nLast disconnect: ${lastDisconnect}\nAudio: ${audioContext?.state||'off'} · session ${navigator.audioSession?.type||'system default'} / ${navigator.audioSession?.state||'unknown'}\nDraw: ${renderCost.toFixed(1)} ms · ${state.audio.refreshing?'refreshing devices':state.audio.receiveText}\nMicrophone: ${microphone?'armed':'disarmed'} · ${state.releasePending?'PTT release retry pending':'PTT release clear'}`);
 }
 function setting(id) { return state?.settings?.find(item=>item.id===id); }
 function discreteLevel(item, maximum, normalized) {
@@ -246,38 +248,135 @@ function renderAudio() {
   setText($('receiveStatus'),a.receiveText);setText($('microphoneStatus'),a.microphoneText);value('receiveLevel',a.receiveLevel);value('microphoneLevel',a.microphoneLevel);value('pttLimit',a.pttLimit);
   for(const [id,amount]of [['receiveInput',a.inputPeak],['receiveOutput',a.outputPeak],['microphoneInput',a.micInputPeak],['microphoneOutput',a.micOutputPeak]])$(id).value=Math.min(1,Math.max(0,amount));
   $('listen').classList.toggle('selected',listening);setText($('listen'),listening?'Stop listening':'Listen in this browser');$('listen').disabled=listeningBusy;$('microphone').classList.toggle('selected',microphone);setText($('microphone'),microphone?'Disarm browser microphone':!browserMicAvailable()?'Browser microphone unavailable':microphoneBusy?'Waiting for microphone…':'Arm browser microphone');$('microphone').disabled=microphoneBusy||!browserMicAvailable();
+  $('playbackMicWorkaround').disabled=!navigator.audioSession||microphone||microphoneBusy;
+  $('stableAudio').disabled=!navigator.audioSession||$('playbackMicWorkaround').checked;
+}
+function connectionLost(connection,reason){
+  if(socket!==connection)return;
+  socket=null;lastDisconnect=reason;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);
+  tuningQueue?.clear();stopClientAudio();
+  for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}
+  pending.clear();edits.clear();client=0;
+  $('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;
+  setText($('connectionStatus'),'Browser disconnected · readings paused');
+  setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');
+  if(!scopeFrozen){scopeBins=null;scheduleScopes();}
+  if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}
+}
+function retireConnection(connection,reason){
+  connectionLost(connection,reason);
+  try{connection.close(4000,reason);}catch{}
 }
 function reconnect() {
   if(closing)return;clearTimeout(reconnectTimer);
-  reconnectTimer=setTimeout(async()=>{try{const reply=await fetch('/api/state',{signal:AbortSignal.timeout(6000)});if(reply.status===401){$('login').hidden=false;$('app').hidden=true;return;}if(!reply.ok)throw new Error('Station unavailable');connectWeb();}catch{reconnectDelay=Math.min(10000,reconnectDelay*1.5);reconnect();}},reconnectDelay);
+  const revision=connectionRevision;
+  reconnectTimer=setTimeout(async()=>{
+    if(closing||revision!==connectionRevision||(socket&&socket.readyState<2))return;
+    const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),6000);
+    try{
+      const reply=await fetch('/api/ping',{signal:controller.signal,cache:'no-store'});
+      if(closing||revision!==connectionRevision||(socket&&socket.readyState<2))return;
+      if(reply.status===401){$('login').hidden=false;$('app').hidden=true;$('mobilePttBar').hidden=true;return;}
+      if(!reply.ok)throw new Error('Station unavailable');
+      connectWeb();
+    }catch{if(!closing&&revision===connectionRevision){reconnectDelay=Math.min(10000,reconnectDelay*1.5);reconnect();}}
+    finally{clearTimeout(timeout);}
+  },reconnectDelay);
 }
 async function connectWeb() {
-  if(closing)return;clearTimeout(reconnectTimer);clearInterval(heartbeat);let receivedState=false;const connection=new WebSocket(`wss://${location.host}/ws`);socket=connection;socket.binaryType='arraybuffer';
-  socket.onopen=()=>{if(socket!==connection)return;reconnectDelay=2000;subscribeScopes();heartbeat=setInterval(()=>{if(connection.readyState===1)connection.send(new URLSearchParams({action:'heartbeat'}).toString());},2000);};
-  socket.onmessage=event=>{
+  if(closing)return;
+  clearTimeout(reconnectTimer);clearTimeout(connectionTimer);clearInterval(heartbeat);++connectionRevision;
+  const previous=socket;if(previous)retireConnection(previous,'Connection replaced');clearTimeout(reconnectTimer);
+  let receivedState=false,delayedTick=false,lastReply=performance.now(),lastTick=lastReply,connection;
+  try{connection=new WebSocket(`wss://${location.host}/ws`);}catch{
+    lastDisconnect='Cannot open station WebSocket';reconnectDelay=Math.min(10000,reconnectDelay*1.5);reconnect();return;
+  }
+  socket=connection;socket.binaryType='arraybuffer';
+  connectionTimer=setTimeout(()=>{if(socket===connection)retireConnection(connection,'Station handshake timed out');},8000);
+  const keepAlive=()=>{
+    if(socket!==connection||connection.readyState!==1)return;
+    const now=performance.now();
+    // Forgive one delayed JavaScript tick, then require a fresh server reply.
+    // Native WebSocket pongs cover rendering pauses without relying on this timer.
+    if(now-lastTick>6000&&!delayedTick){lastReply=now;delayedTick=true;}
+    lastTick=now;
+    if(now-lastReply>15000){retireConnection(connection,'Station heartbeat reply timed out');return;}
+    if(connection.bufferedAmount>32768)return;
+    try{connection.send('action=heartbeat');}catch{retireConnection(connection,'Station heartbeat send failed');}
+  };
+  connection.onopen=()=>{if(socket!==connection)return;reconnectDelay=2000;lastReply=lastTick=performance.now();keepAlive();heartbeat=setInterval(keepAlive,2000);};
+  connection.onmessage=event=>{
     if(socket!==connection)return;
     if(typeof event.data!=='string'){binary(event.data);return;}
-    const data=JSON.parse(event.data);
-    if(data.type==='delta'){if(!state)return;render(mergeState(state,data));return;}
-    if(data.type==='hello'){client=data.client;return;}if(data.type==='state'){render(data);if(!receivedState){receivedState=true;subscribeScopes();preferenceSaver?.flush();}return;}
+    let data;
+    try{data=JSON.parse(event.data);}catch{retireConnection(connection,'Invalid station reply');return;}
+    if(data.type==='heartbeat'){lastReply=performance.now();delayedTick=false;return;}
+    if(data.type==='controlIdle'){
+      if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});
+      stopMicrophone();setText($('browserStatus'),'Browser microphone disarmed after a control pause. Arm it again to transmit.');return;
+    }
+    if(data.type==='delta'){if(!receivedState)return;render(mergeState(state,data));return;}
+    if(data.type==='hello'){client=data.client;return;}
+    if(data.type==='state'){
+      render(data);
+      if(!receivedState){receivedState=true;clearTimeout(connectionTimer);lastReply=performance.now();subscribeScopes();preferenceSaver?.flush();}
+      return;
+    }
     if(data.type==='error'){notify(data.error);return;}
     if(data.type==='ack'){const waiting=pending.get(data.seq);if(!waiting)return;lastCommandMs=performance.now()-waiting.sent;clearTimeout(waiting.timer);pending.delete(data.seq);const edit=edits.get(waiting.editKey);if(data.ok){if(edit?.seq===data.seq)edit.revision=data.revision||0;waiting.resolve(data);}else{if(edit?.seq===data.seq)edits.delete(waiting.editKey);waiting.reject(new Error(data.error));}}
   };
-  socket.onclose=()=>{if(socket!==connection)return;cancelTunerClick();clearInterval(heartbeat);tuningQueue?.clear();stopClientAudio();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}pending.clear();edits.clear();client=0;$('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;setText($('connectionStatus'),'Browser disconnected · readings paused');setText($('footerStatus'),'Connection lost · controls paused · browser audio stopped');if(!scopeFrozen){scopeBins=null;scheduleScopes();}if(!closing){notify('Station connection lost. Browser audio stopped; reconnecting…');reconnect();}};
-  socket.onerror=()=>{};
+  connection.onclose=event=>connectionLost(connection,'WebSocket closed ('+(event.code||1006)+')'+(event.reason?': '+event.reason:''));
+  connection.onerror=()=>{};
 }
-function audioSessionType(capturing=false) {
-  try { if(navigator.audioSession)navigator.audioSession.type=capturing||(listening&&$('stableAudio')?.checked)?'play-and-record':'playback'; }catch{}
+function disablePlaybackMicWorkaround() {
+  $('playbackMicWorkaround').checked=false;playbackMicActive=false;
+  try{localStorage.setItem('playbackMicWorkaround','0');}catch{}
 }
-function audioInterrupted(message) {
+function audioSessionType(capturing=microphone, preparing=false, listeningNow=listening) {
+  const session=navigator.audioSession,workaround=!!$('playbackMicWorkaround')?.checked;
+  playbackMicActive=!!session&&capturing&&!preparing&&workaround;
+  if(!session)return;
+  const record=capturing||(listeningNow&&$('stableAudio')?.checked&&!workaround);
+  try{
+    session.type=record&&!playbackMicActive?'play-and-record':'playback';
+    if(playbackMicActive&&session.type!=='playback')throw new Error('Playback session was not applied');
+  }catch{
+    if(playbackMicActive){
+      disablePlaybackMicWorkaround();
+      try{session.type=capturing?'play-and-record':'playback';}catch{}
+      notify('Playback-volume workaround unavailable. Using standard microphone audio.');
+    }
+  }
+}
+function audioInterrupted(message, checkPlayback=false) {
+  if(checkPlayback&&playbackMicActive){
+    disablePlaybackMicWorkaround();
+    message+=' Playback-volume workaround switched off. Arm the microphone again.';
+  }
   if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});
   stopMicrophone();setText($('browserStatus'),message);$('resumeAudio').hidden=false;updateDiagnostics();
 }
+function browserPlaybackGain(volume,boostDb){
+  const level=Number(volume),boost=Number(boostDb);
+  return Math.max(0,Math.min(100,Number.isFinite(level)?level:100))/100*
+    Math.pow(10,Math.max(0,Math.min(24,Number.isFinite(boost)?boost:6))/20);
+}
+function browserPlaybackCurve(){
+  const curve=new Float32Array(4097);
+  for(let i=0;i<curve.length;i++){
+    const x=2*i/(curve.length-1)-1,magnitude=Math.abs(x);
+    curve[i]=magnitude<=.85?x:Math.sign(x)*(.85+.15*Math.tanh((magnitude-.85)/.15));
+  }
+  return curve;
+}
+function applyBrowserPlaybackLevel(){
+  if(listeningGain)listeningGain.gain.value=browserPlaybackGain($('browserVolume').value,$('browserBoostDb').value);
+}
 async function ensureAudio() {
   if(!window.AudioContext)throw new Error('This browser does not support Web Audio playback');
-  if(!audioContext){audioContext=new AudioContext({latencyHint:'interactive',sampleRate:48000});const context=audioContext;const resumed=context.resume();audioSetup=(async()=>{await resumed;if(isSecureContext&&window.AudioWorkletNode&&context.audioWorklet){await context.audioWorklet.addModule('/audio-worklet.js');audioNode=new AudioWorkletNode(context,'station-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});audioNode.supportsMicrophone=true;}else audioNode=new StationPlayback(context);listeningGain=context.createGain();listeningGain.gain.value=Number($('browserVolume').value)/100;audioNode.connect(listeningGain).connect(context.destination);if(isSecureContext&&context.setSinkId&&$('browserOutput').value)await context.setSinkId($('browserOutput').value);audioNode.port.onmessage=({data})=>{if(data.kind==='mic'&&microphone&&socket?.readyState===1&&socket.bufferedAmount<8192)socket.send(data.buffer);if(data.kind==='peak')$('clientMicPeak').value=data.value;};})().catch(async error=>{await context.close().catch(()=>{});if(audioContext===context){audioContext=audioNode=listeningGain=audioSetup=null;}throw error;});}
+  if(!audioContext){audioContext=new AudioContext({latencyHint:'interactive',sampleRate:48000});const context=audioContext;const resumed=context.resume();audioSetup=(async()=>{await resumed;if(isSecureContext&&window.AudioWorkletNode&&context.audioWorklet){await context.audioWorklet.addModule('/audio-worklet.js');audioNode=new AudioWorkletNode(context,'station-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});audioNode.supportsMicrophone=true;}else audioNode=new StationPlayback(context);listeningGain=context.createGain();applyBrowserPlaybackLevel();const peakGuard=context.createWaveShaper();peakGuard.curve=browserPlaybackCurve();audioNode.connect(listeningGain).connect(peakGuard).connect(context.destination);if(isSecureContext&&context.setSinkId&&$('browserOutput').value)await context.setSinkId($('browserOutput').value);audioNode.port.onmessage=({data})=>{if(data.kind==='mic'&&microphone&&socket?.readyState===1&&socket.bufferedAmount<8192)socket.send(data.buffer);if(data.kind==='peak')$('clientMicPeak').value=data.value;};})().catch(async error=>{await context.close().catch(()=>{});if(audioContext===context){audioContext=audioNode=listeningGain=audioSetup=null;}throw error;});}
   await audioSetup;
-  audioContext.onstatechange=()=>{updateDiagnostics();if(['interrupted','suspended','closed'].includes(audioContext.state)&&(microphone||microphoneBusy))audioInterrupted('Audio interrupted. Tap Resume audio, then arm the microphone again.');};
+  audioContext.onstatechange=()=>{updateDiagnostics();if(['interrupted','suspended','closed'].includes(audioContext.state)&&(microphone||microphoneBusy))audioInterrupted('Audio interrupted. Tap Resume audio, then arm the microphone again.',true);};
   await audioContext.resume();
 }
 async function ensureReceive() {
@@ -288,18 +387,41 @@ async function ensureReceive() {
 }
 async function listen() {
   if(listeningBusy)return;listeningBusy=true;const epoch=audioEpoch;renderAudio();
-  try{if(listening){listening=false;audioNode?.port.postMessage({kind:'listen',enabled:false});await command('listen',{enabled:'0'});setText($('browserStatus'),'Listening stopped.');}
-  else{if($('stableAudio')?.checked){try{if(navigator.audioSession)navigator.audioSession.type='play-and-record';}catch{}}await ensureAudio();await ensureReceive();await command('listen',{enabled:'1'});if(epoch!==audioEpoch||socket?.readyState!==1)throw new Error('Connection changed; enable listening again');listening=true;expectedAudio=undefined;audioSessionType();audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
+  try{if(listening){listening=false;audioSessionType();audioNode?.port.postMessage({kind:'listen',enabled:false});await command('listen',{enabled:'0'});setText($('browserStatus'),'Listening stopped.');}
+  else{audioSessionType(microphone,false,true);await ensureAudio();await ensureReceive();await command('listen',{enabled:'1'});if(epoch!==audioEpoch||socket?.readyState!==1)throw new Error('Connection changed; enable listening again');listening=true;expectedAudio=undefined;audioSessionType();audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
   finally{listeningBusy=false;renderAudio();}
 }
-function stopMicrophone() { ++audioEpoch;microphone=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;micStream?.getTracks().forEach(track=>track.stop());micStream=null;if(micRegistered){micRegistered=false;command('browserMic',{enabled:'0'}).catch(()=>{});}audioSessionType();$('clientMicPeak').value=0;if(state)renderAudio(); }
+function stopMicrophone() { ++audioEpoch;microphone=false;playbackMicActive=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;const stream=micStream;micStream=null;stream?.getTracks().forEach(track=>track.stop());if(micRegistered){micRegistered=false;command('browserMic',{enabled:'0'}).catch(()=>{});}audioSessionType();$('clientMicPeak').value=0;if(state)renderAudio(); }
 function stopClientAudio() { listening=false;stopMicrophone();audioNode?.port.postMessage({kind:'listen',enabled:false});audioNode?.port.postMessage({kind:'reset'});expectedAudio=undefined;setText($('browserStatus'),'Browser audio stopped.');if(state)renderAudio(); }
 async function armMicrophone() {
   if(microphone){if(state.browserOwner===client)await command('ptt',{enabled:'0'});stopMicrophone();setText($('browserStatus'),'Browser microphone disarmed.');return;}
   if(!browserMicAvailable())throw new Error('Microphone capture needs a supported browser and trusted HTTPS. Install and trust the station certificate, then open this page in Safari or another current browser.');
   if(!state.online||state.demo||!state.audio.maps[3])throw new Error('Connect the radio and choose its USB transmit playback device first');
   if(microphoneBusy)return;microphoneBusy=true;const epoch=audioEpoch,owner=client;renderAudio();
-  try{audioSessionType(true);await ensureAudio();const device=$('browserInput').value;const stream=await navigator.mediaDevices.getUserMedia({audio:{...(device?{deviceId:{exact:device}}:{}),channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});micStream=stream;if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');await command('audioMap',{slot:'2',device:'browser:capture'});await command('browserMic',{enabled:'1'});micRegistered=true;if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');for(const track of stream.getAudioTracks()){track.addEventListener('ended',()=>audioInterrupted('Microphone disconnected. Choose a device and arm it again.'),{once:true});track.addEventListener('mute',()=>audioInterrupted('Microphone interrupted. Tap Resume audio and arm it again.'),{once:true});}await audioContext.resume();micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;audioNode.port.postMessage({kind:'gate',enabled:!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});setText($('browserStatus'),'Microphone armed. Tap PTT on to transmit, then PTT off.');browserDevices().catch(error=>notify(error.message));}
+  try{
+    // Request a capture-compatible session before permission/device access.
+    // The optional playback override is applied only after capture is live.
+    audioSessionType(true,true);await ensureAudio();
+    const device=$('browserInput').value;
+    const stream=await navigator.mediaDevices.getUserMedia({audio:{...(device?{deviceId:{exact:device}}:{}),channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    micStream=stream;
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');
+    await command('audioMap',{slot:'2',device:'browser:capture'});await command('browserMic',{enabled:'1'});micRegistered=true;
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');
+    for(const track of stream.getAudioTracks()){
+      track.addEventListener('ended',()=>{if(micStream===stream)audioInterrupted('Microphone disconnected. Choose a device and arm it again.',true);},{once:true});
+      track.addEventListener('mute',()=>{if(micStream===stream)audioInterrupted('Microphone interrupted. Tap Resume audio and arm it again.',true);},{once:true});
+    }
+    await audioContext.resume();micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;
+    audioSessionType();
+    if(!microphone||stream.getAudioTracks().some(track=>track.readyState==='ended'||track.muted)){
+      if(playbackMicActive)disablePlaybackMicWorkaround();
+      throw new Error('Microphone did not remain active. Arm it again with the playback-volume workaround off.');
+    }
+    audioNode.port.postMessage({kind:'gate',enabled:!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
+    setText($('browserStatus'),playbackMicActive?'Microphone armed with playback-volume workaround. Check the mic meter before using PTT.':'Microphone armed. Tap PTT on to transmit, then PTT off.');
+    browserDevices().catch(error=>notify(error.message));
+  }
   catch(error){stopMicrophone();throw error;}
   finally{microphoneBusy=false;renderAudio();}
 }
@@ -366,11 +488,13 @@ function drawRfWaterfallCanvas(canvasId,detailId,compact=false){
   const item=canvasContext(canvasId);if(!item)return;
   const center=rfCenterHz||state?.rfScope?.centerHz||state?.vfos?.[state.activeVfo==='B'?1:0]?.frequency||0,span=rfSpanHz||200000;
   const {context:c,width,height}=item;c.fillStyle='#08101d';c.fillRect(0,0,width,height);c.font='11px system-ui';const waterfall={c,x:54,y:8,w:width-70,h:height-35};
-  const pixelRatio=devicePixelRatio||1,rows=Math.min(rfRows.length,Math.ceil(waterfall.h*pixelRatio));
-  if(rows){const image=waterfallImage(canvasId,850,Math.ceil(waterfall.h*pixelRatio),rfRows,[rfCenterHz,rfSpanHz,rfHistory.generation].join('/'),(row,x,width,data,offset)=>{const value=row?row[x]:0;for(let c=0;c<4;c++)data[offset+c]=rfColors[value*4+c];});waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,waterfall.h);}
+  // Two CSS pixels per real frame, independent of phone pixel density. This
+  // keeps the same scroll speed on desktop and high-DPI mobile displays.
+  const historyHeight=Math.max(1,Math.ceil(waterfall.h/2)),rows=Math.min(rfRows.length,historyHeight);
+  if(rows){const image=waterfallImage(canvasId,850,historyHeight,rfRows,[rfSpanHz,rfHistory.generation].join('/'),(row,x,width,data,offset)=>{const value=row?row[x]:0;for(let c=0;c<4;c++)data[offset+c]=rfColors[value*4+c];});waterfall.c.drawImage(image,waterfall.x,waterfall.y,waterfall.w,waterfall.h);}
   const divisions=compact?2:4;c.fillStyle='#8da2b8';c.strokeStyle='#1f3040';c.lineWidth=1;
   for(let i=0;i<=divisions;i++){const px=waterfall.x+waterfall.w*i/divisions;c.beginPath();c.moveTo(px,waterfall.y);c.lineTo(px,waterfall.y+waterfall.h);c.stroke();c.textAlign=i===0?'left':i===divisions?'right':'center';const hz=center?center-span/2+span*i/divisions:0;c.fillText(center?frequency(hz):`${Math.round((i/divisions-.5)*span/1000)} kHz`,px,waterfall.y+waterfall.h+20);}
-  const fresh=state?.rfScope?.frameValid&&rfHistory.fresh();setText($(detailId),rfRows.length?(fresh?(compact?`${Math.min(rfRows.length,rows)} rows · newest at top`:`${rfRows.length} frames · newest at top`):'Frozen history · waiting for fresh RF frames'):(compact?'Waiting for RF frames':'No RF frames received'));
+  const fresh=state?.rfScope?.frameValid&&rfHistory.fresh();setText($(detailId),rfRows.length?(fresh?(compact?`2× scroll · ${rows} frames`:`2× scroll · ${rfRows.length} frames · newest at top`):'Frozen history · waiting for fresh RF frames'):(compact?'Waiting for RF frames':'No RF frames received'));
 }
 function drawRfScope(){
   drawMobileRfPreview();if(!$('rfScope')||$('rfScope').hidden)return;
@@ -389,8 +513,11 @@ function tuneRfFromCanvas(event,id){
 }
 function installPageLifecycle(){
   window.addEventListener('resize',scheduleScopes);
-  window.addEventListener('pagehide',()=>{closing=true;cancelTunerClick();clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
+  window.addEventListener('pagehide',()=>{closing=true;++connectionRevision;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
   window.addEventListener('pageshow',event=>{if(event.persisted){closing=false;connectWeb();setText($('browserStatus'),'Page restored. Enable listening and arm the microphone again.');}});
+  const wake=()=>{if(!closing&&(!socket||socket.readyState>1)){reconnectDelay=250;reconnect();}};
+  window.addEventListener('online',wake);
+  document.addEventListener?.('visibilitychange',()=>{if(!document.hidden)wake();});
 }
 async function exportCsv(){if(!state)return;const cell=value=>'"'+String(value??'').replace(/"/g,'""')+'"',utc=new Date().toISOString();const rows=[['Name','Group','Hamlib ID','Value','Raw value','Access','Range','Status','VFO','UTC']];state.vfos.forEach((vfo,index)=>{const name=index?'B':'A';for(const [field,label,valid,reading]of [['frequency','frequency (Hz)',vfo.frequencyValid,String(vfo.frequency)],['mode','mode / width',vfo.modeValid,vfo.mode+' / '+vfo.width]])rows.push(['VFO '+name+' '+label,'Radio / VFO','VFO'+name+'.'+field,valid?reading:'',valid?reading:'','Read / write','',valid?'Live':'Unavailable',name,utc]);});for(const item of state.settings)rows.push([item.name,item.group,item.id,item.valid?item.display:'',item.valid?item.value:'',item.writable?'Read / write':'Read only',item.range,item.status,state.settingsVfo,utc]);const blob=new Blob(['\ufeff'+rows.map(row=>row.map(cell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=element('a');link.href=url;link.download='FT710-settings.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function setup(){
@@ -436,9 +563,11 @@ function setup(){
   $('browserMappings').addEventListener('click',protect(async()=>{await command('audioMap',{slot:'1',device:'browser:playback'});if(browserMicAvailable())await command('audioMap',{slot:'2',device:'browser:capture'});notify('Browser listening selected. Choose the radio USB source, then enable receive audio.',false);}));
   $('listen').addEventListener('click',protect(listen));$('microphone').addEventListener('click',protect(armMicrophone));$('browserDevices').addEventListener('click',protect(browserDevices));
   for(const id of ['browserInput','browserOutput']){const saved=localStorage.getItem(id);if(saved){const option=element('option','Saved device / refresh devices');option.value=saved;$(id).append(option);$(id).value=saved;}}
+  const savedBoost=localStorage.getItem('browserBoostDb');if([...$('browserBoostDb').options].some(option=>option.value===savedBoost))$('browserBoostDb').value=savedBoost;
+  $('browserBoostDb').addEventListener('change',()=>{localStorage.setItem('browserBoostDb',$('browserBoostDb').value);applyBrowserPlaybackLevel();});
   const savedVolume=localStorage.getItem('browserVolume');if(savedVolume!==null&&Number.isFinite(Number(savedVolume)))$('browserVolume').value=Math.max(0,Math.min(100,Number(savedVolume)));
   $('browserInput').addEventListener('change',()=>{localStorage.setItem('browserInput',$('browserInput').value);if(microphone||microphoneBusy){stopMicrophone();notify('Microphone selection changed. Arm the browser microphone again.',false);if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});}});
-  $('browserOutput').addEventListener('change',protect(async()=>{await ensureAudio();if(!audioContext.setSinkId)throw new Error('This browser uses the system output');await audioContext.setSinkId($('browserOutput').value);localStorage.setItem('browserOutput',$('browserOutput').value);}));$('browserVolume').addEventListener('input',()=>{localStorage.setItem('browserVolume',$('browserVolume').value);if(listeningGain)listeningGain.gain.value=Number($('browserVolume').value)/100;});
+  $('browserOutput').addEventListener('change',protect(async()=>{await ensureAudio();if(!audioContext.setSinkId)throw new Error('This browser uses the system output');await audioContext.setSinkId($('browserOutput').value);localStorage.setItem('browserOutput',$('browserOutput').value);}));$('browserVolume').addEventListener('input',()=>{localStorage.setItem('browserVolume',$('browserVolume').value);applyBrowserPlaybackLevel();});
   for(const id of ['scopeSpan','scopeGain','scopeFloor']){const saved=localStorage.getItem(id);if([...$(id).options].some(option=>option.value===saved))$(id).value=saved;$(id).addEventListener('change',()=>{localStorage.setItem(id,$(id).value);drawScope();});}
   // Station preferences come from the server; localStorage holds local display/audio choices only.
   const savedRfLevel=localStorage.getItem('rfWaterfallLevel');if(savedRfLevel!==null&&Number.isFinite(Number(savedRfLevel))&&Number(savedRfLevel)>=-30&&Number(savedRfLevel)<=30&&Number.isInteger(Number(savedRfLevel)*2))$('rfWaterfallLevel').value=Number(savedRfLevel).toFixed(1);
@@ -449,13 +578,17 @@ function setup(){
   for(const id of ['rfSpectrumCanvas','rfWaterfallCanvas','mobileRfSpectrumCanvas','mobileRfWaterfallCanvas'])$(id).addEventListener('click',protect(event=>tuneRfFromCanvas(event,id)));
   const savedStep=localStorage.getItem('step');if([...$('step').options].some(option=>option.value===savedStep))$('step').value=savedStep;$('step').addEventListener('change',()=>localStorage.setItem('step',$('step').value));
   $('scopeFreeze').addEventListener('click',()=>{scopeFrozen=!scopeFrozen;setText($('scopeFreeze'),scopeFrozen?'Resume':'Freeze');$('scopeFreeze').classList.toggle('selected',scopeFrozen);drawScope();});$('scopePeak').addEventListener('click',()=>{scopePeakHold=!scopePeakHold;scopePeaks=null;setText($('scopePeak'),'Peak hold: '+(scopePeakHold?'On':'Off'));$('scopePeak').classList.toggle('selected',scopePeakHold);drawScope();});$('scopeClear').addEventListener('click',clearScope);
-  $('logout').addEventListener('click',protect(async()=>{if(state?.browserOwner===client)await command('ptt',{enabled:'0'});closing=true;cancelTunerClick();clearTimeout(reconnectTimer);socket?.close();stopClientAudio();await fetch('/api/logout',{method:'POST'});$('app').hidden=true;$('mobilePttBar').hidden=true;$('login').hidden=false;}));
+  $('logout').addEventListener('click',protect(async()=>{if(state?.browserOwner===client)await command('ptt',{enabled:'0'});closing=true;++connectionRevision;cancelTunerClick();clearTimeout(connectionTimer);clearTimeout(reconnectTimer);socket?.close();stopClientAudio();await fetch('/api/logout',{method:'POST'});$('app').hidden=true;$('mobilePttBar').hidden=true;$('login').hidden=false;}));
   const stable=localStorage.getItem('stableAudio');$('stableAudio').checked=stable!=='0';$('stableAudio').disabled=!navigator.audioSession;
   $('stableAudio').addEventListener('change',()=>{localStorage.setItem('stableAudio',$('stableAudio').checked?'1':'0');audioSessionType(microphone);});
+  $('playbackMicWorkaround').checked=!!navigator.audioSession&&localStorage.getItem('playbackMicWorkaround')==='1';
+  $('playbackMicWorkaround').disabled=!navigator.audioSession;
+  $('stableAudio').disabled=!navigator.audioSession||$('playbackMicWorkaround').checked;
+  $('playbackMicWorkaround').addEventListener('change',()=>{localStorage.setItem('playbackMicWorkaround',$('playbackMicWorkaround').checked?'1':'0');audioSessionType();if(state)renderAudio();});
   $('resumeAudio').addEventListener('click',protect(async()=>{await ensureAudio();$('resumeAudio').hidden=true;setText($('browserStatus'),'Audio resumed. Arm the microphone again to transmit.');}));
   $('unattended').addEventListener('change',protect(()=>command('unattended',{enabled:$('unattended').checked?'1':'0'})));
   navigator.mediaDevices?.addEventListener?.('devicechange',()=>{browserDevices().catch(()=>{});updateDiagnostics();});
-  navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.');});
+  navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.',true);});
   document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelTunerClick();subscribeScopes();if(document.hidden&&(microphone||microphoneBusy))audioInterrupted('Microphone disarmed while the page was hidden. Arm it again to transmit.');else scheduleScopes();});
   installPageLifecycle();
   setInterval(()=>setText($('clock'),new Date().toISOString().slice(11,19)+' UTC'),1000);

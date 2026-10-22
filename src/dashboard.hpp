@@ -32,6 +32,9 @@ private:
     std::set<std::uint64_t> browserMicClients_;
     TaskQueue audioJobs_, scopeJobs_;
     bool closing_ = false, audioRefreshing_ = false, rfApplying_ = false, rfCaptureWanted_ = false, rfCaptureChanging_ = false;
+    std::thread shutdownThread_;
+    std::atomic<bool> shutdownDone_{false};
+    std::atomic<unsigned> shutdownStage_{0};
     bool unattended_ = false;
     std::uint64_t audioRefreshRevision_ = 0, rfOperationRevision_ = 0;
     std::wstring preferencesError_;
@@ -136,6 +139,10 @@ private:
     void publishWeb(bool urgent = false);
     void webCommand(const std::shared_ptr<web::Request>& request);
     void stopAudio();
+    void requestServicesStop();
+    void stopServices();
+    void recordShutdownStage(unsigned stage);
+    void finishShutdown();
     void toggleAudio(bool microphone);
     void savePreferences();
     void loadPreferences();

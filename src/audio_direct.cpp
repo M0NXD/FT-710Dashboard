@@ -49,19 +49,26 @@ void check(PaError result, const char* operation) {
 
 // All PortAudio control calls/COM objects belong to one STA thread. Two route
 // threads may stream concurrently; callbacks never wait on this control queue.
+class Driver;
+std::atomic<Driver*> activeDriver{nullptr};
 class Driver {
 public:
     PaError initialized = paNotInitialized;
     unsigned streams = 0;
-    Driver() { thread_ = std::thread([this] { run(); }); }
-    ~Driver() {
-        { std::lock_guard lock(mutex_); stopping_ = true; } wake_.notify_one(); thread_.join();
+    Driver() { thread_ = std::thread([this] { run(); }); activeDriver = this; }
+    ~Driver() { stop(); activeDriver = nullptr; }
+    void stop() {
+        { std::lock_guard lock(mutex_); stopping_ = true; }
+        wake_.notify_one();
+        if (thread_.joinable()) thread_.join();
     }
     template<class F> auto call(F action) -> decltype(action()) {
         using Result = decltype(action());
         auto task = std::make_shared<std::packaged_task<Result()>>(std::move(action));
         auto future = task->get_future();
-        { std::lock_guard lock(mutex_); jobs_.push_back([task] { (*task)(); }); }
+        { std::lock_guard lock(mutex_);
+          if (stopping_) throw std::runtime_error("Audio driver is shutting down");
+          jobs_.push_back([task] { (*task)(); }); }
         wake_.notify_one(); return future.get();
     }
     void refresh() {
@@ -233,6 +240,7 @@ Format format(PaDeviceIndex index, bool input) {
 }
 
 std::wstring directDeviceIssue() { std::lock_guard lock(issueMutex); return deviceIssue; }
+void shutdownDriver() { if (auto* current = activeDriver.load()) current->stop(); }
 std::vector<Device> directDevices() {
     try {
         auto result = driver().call([&] {
@@ -258,6 +266,7 @@ void Route::runDirect(std::wstring source, std::wstring destination) {
     PaStream* capture = nullptr; PaStream* render = nullptr;
     try {
         driver().call([&] {
+            if (shuttingDown_) return;
             if (!driver().streams) driver().refresh();
             check(driver().initialized, "Direct audio driver");
             Format input{}, output{};
@@ -284,7 +293,7 @@ void Route::runDirect(std::wstring source, std::wstring destination) {
             if (capture) check(Pa_StartStream(capture), "Start capture device");
         });
         { std::lock_guard lock(mutex_); status_.active = true; status_.starting = false; status_.text = L"Running / host hardware"; }
-        while (true) {
+        while (!shuttingDown_) {
             DWORD wait = WaitForSingleObject(stopEvent_, 100);
             if (wait == WAIT_OBJECT_0) break;
             if (wait == WAIT_FAILED) throw std::runtime_error("Direct audio stop wait failed.");
