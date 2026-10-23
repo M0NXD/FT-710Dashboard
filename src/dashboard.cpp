@@ -1284,6 +1284,16 @@ void Dashboard::updateRows() {
     }
 }
 void Dashboard::log(const std::wstring& text) {
+    if (capturePath_.empty() && !iniPath_.empty() &&
+        (text.starts_with(L"CAT client ") || text.starts_with(L"CAT sharing"))) {
+        try {
+            const auto path = std::filesystem::path(iniPath_).parent_path() / L"cat-sharing.log";
+            std::error_code error;
+            const auto size = std::filesystem::file_size(path, error);
+            std::ofstream file(path, !error && size >= 1024 * 1024 ? std::ios::trunc : std::ios::app);
+            file << narrow(utc()) << "  " << narrow(text) << '\n';
+        } catch (...) { /* Logging must never prevent radio control. */ }
+    }
     activity_.push_back(utc() + L"  " + text);
     if (activity_.size() > 500) activity_.erase(activity_.begin(), activity_.begin() + 100);
     std::wstring all;

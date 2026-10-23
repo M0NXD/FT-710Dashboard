@@ -18,6 +18,19 @@ bool sendAll(SOCKET socket, const std::string& message) {
     }
     return true;
 }
+bool peerClosed(SOCKET socket) {
+    fd_set readable; FD_ZERO(&readable); FD_SET(socket, &readable);
+    timeval timeout{};
+    const auto ready = select(0, &readable, nullptr, nullptr, &timeout);
+    if (ready == SOCKET_ERROR) return true;
+    if (!ready) return false;
+    char byte{};
+    const auto received = recv(socket, &byte, 1, MSG_PEEK);
+    if (received == 0) return true;
+    if (received != SOCKET_ERROR) return false;
+    const auto error = WSAGetLastError();
+    return error != WSAEWOULDBLOCK && error != WSAETIMEDOUT;
+}
 std::string canonical(std::string name) {
     static const std::map<std::string, std::string> aliases{
         {"f","get_freq"},{"F","set_freq"},{"m","get_mode"},{"M","set_mode"},
@@ -212,12 +225,29 @@ void CatServer::serve(Client& client) {
                 if (!reply.result) {
                     auto job = std::make_shared<radio::CatJob>(); job->request = request;
                     try {
+                        const auto began = std::chrono::steady_clock::now();
                         auto future = handler_(job);
-                        auto deadline = std::chrono::steady_clock::now() + 45s;
-                        while (running_ && std::chrono::steady_clock::now() < deadline && future.wait_for(50ms) != std::future_status::ready) {}
-                        if (!running_ || future.wait_for(0ms) != std::future_status::ready) {
+                        // Normal CAT replies must finish before the advertised
+                        // NET timeout (+500 ms in Hamlib). Explicit power-up can
+                        // legitimately take longer; still watch for a lost peer.
+                        const auto deadline = began + (request.name == "set_powerstat" ? 30s : 5s);
+                        bool peerGone = false, waitingLogged = false;
+                        while (running_ && std::chrono::steady_clock::now() < deadline && future.wait_for(20ms) != std::future_status::ready) {
+                            if (peerClosed(client.socket)) { peerGone = true; break; }
+                            if (!waitingLogged && std::chrono::steady_clock::now() - began >= 1s) {
+                                waitingLogged = true;
+                                log_("CAT client " + std::to_string(client.id) + ": " + request.name +
+                                    (job->started ? " waiting for radio operation for over 1 s." : " waiting in command queue for over 1 s."));
+                            }
+                        }
+                        if (!running_ || peerGone || future.wait_for(0ms) != std::future_status::ready) {
                             job->cancelled = true; reply.result = -5; connected = false;
-                        } else reply = future.get();
+                            log_("CAT client " + std::to_string(client.id) + ": " + request.name +
+                                (peerGone ? " client disconnected while waiting; queued work cancelled." : " reply deadline reached or server stopped; queued work cancelled."));
+                        } else {
+                            reply = future.get();
+                            if (reply.result == -5 && !job->started) connected = false;
+                        }
                     } catch (...) { reply.result = -7; connected = false; }
                 }
             }

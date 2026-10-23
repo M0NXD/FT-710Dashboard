@@ -216,16 +216,18 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
     {
         std::lock_guard lock(mutex_);
         bool release = job->request.name == "__release_client";
-        if (stopping_ || (!release && commands_.size() >= 128)) {
+        if (stopping_ || (!releasesPtt(job->request) && commands_.size() >= 128)) {
             CatReply reply; reply.result = stopping_ ? -RIG_EIO : -RIG_ELIMIT;
             job->reply.set_value(std::move(reply)); return future;
         }
         Command command; command.action = Action::Cat; command.cat = std::move(job); command.queuedAt = Clock::now();
+        command.cat->queueDeadline = command.queuedAt + std::chrono::seconds(3);
         if (release) {
             for (auto& pending : commands_) if (pending.cat && pending.cat->request.client == command.cat->request.client)
                 pending.cat->cancelled = true;
             commands_.push_front(std::move(command));
-        } else if (changesRadio(command)) queueInteractive(std::move(command));
+        } else if (releasesPtt(command.cat->request)) commands_.push_front(std::move(command));
+        else if (changesRadio(command)) queueInteractive(std::move(command));
         else commands_.push_back(std::move(command));
     }
     wake_.notify_one();
@@ -289,8 +291,17 @@ void Worker::run() {
                 CatReply reply;
                 const auto started = Clock::now();
                 try {
-                    if (command.cat->cancelled) reply.result = -RIG_ETIMEOUT;
-                    else reply = executeCat(command.cat->request);
+                    // Do not replay stale client changes when a busy radio
+                    // finally catches up. RX/release requests remain valid.
+                    const bool release = releasesPtt(command.cat->request);
+                    if (!release && (command.cat->cancelled || started >= command.cat->queueDeadline)) {
+                        reply.result = -RIG_ETIMEOUT;
+                        log_("CAT client " + std::to_string(command.cat->request.client) + ": " + command.cat->request.name +
+                            " cancelled before radio execution (disconnected client or expired queue).");
+                    } else {
+                        command.cat->started = true;
+                        reply = executeCat(command.cat->request);
+                    }
                 } catch (const std::invalid_argument& error) {
                     reply.result = -RIG_EINVAL;
                     log_("CAT client " + std::to_string(command.cat->request.client) + ": " + command.cat->request.name + ": " + error.what());
@@ -692,6 +703,7 @@ void Worker::pollMeters(bool publishUpdate) {
         std::lock_guard lock(mutex_);
         return stopping_ || !commands_.empty();
     };
+    if (commandPending()) return;
     ptt_t ptt{};
     state_.pttKnown = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt) == RIG_OK;
     state_.transmitting = state_.pttKnown && ptt != RIG_PTT_OFF;
@@ -703,7 +715,7 @@ void Worker::pollMeters(bool publishUpdate) {
     }
     for (auto& s : state_.settings) if (s.kind == Kind::Level && state_.transmitting &&
         (s.mask == RIG_LEVEL_STRENGTH || s.mask == RIG_LEVEL_RAWSTR)) { s.valid = false; s.status = "RX only"; }
-    if (urgentCommandPending()) { if (publishUpdate) publish(); return; }
+    if (commandPending() || urgentCommandPending()) { if (publishUpdate) publish(); return; }
     // Prioritize the transmitting meters, avoiding duplicate RM5 requests
     // when the calibrated watts meter is available.
     const std::array<setting_t, 9> levels{RIG_LEVEL_RFPOWER_METER_WATTS, RIG_LEVEL_ALC, RIG_LEVEL_SWR,
@@ -789,7 +801,7 @@ bool Worker::poll() {
             (heldPtt_ && !state_.releasePending && Clock::now() >= pttDeadline_) ||
             (state_.releasePending && Clock::now() >= releaseDeadline_);
     };
-    if (urgentCommandPending()) return false;
+    if (pending()) return false;
     // Resume at the next transaction instead of repeating the first queries.
     // Each yield still gives queued PTT, tuning and other writes priority.
     for (;;) {

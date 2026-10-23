@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <future>
 #include <memory>
@@ -24,5 +25,11 @@ struct CatJob {
     CatRequest request;
     std::promise<CatReply> reply;
     std::atomic<bool> cancelled{false};
+    std::atomic<bool> started{false};
+    std::chrono::steady_clock::time_point queueDeadline = std::chrono::steady_clock::time_point::max();
 };
+inline bool releasesPtt(const CatRequest& request) {
+    return request.name == "__release_client" ||
+        (request.name == "set_ptt" && request.arguments.size() == 1 && request.arguments[0] == "0");
+}
 }
