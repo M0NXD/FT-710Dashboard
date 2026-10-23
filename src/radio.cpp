@@ -11,6 +11,9 @@
 namespace radio {
 using Clock = std::chrono::steady_clock;
 namespace {
+bool recentReadback(Clock::time_point time) {
+    return time != Clock::time_point{} && Clock::now() - time < std::chrono::milliseconds(250);
+}
 std::string safe(const char* text) { return text ? text : ""; }
 std::string briefError(int result) {
     auto text = safe(rigerror2(result));
@@ -203,8 +206,8 @@ void Worker::submit(Command command) {
     wake_.notify_one();
 }
 void Worker::queueInteractive(Command command) {
-    // Tuning, mode and PTT need the same priority for GUI and NET clients.
-    // Do not overtake another write or a read belonging to this client.
+    // Keep explicit GUI actions responsive, preserving existing write order.
+    // NET clients use FIFO below so neither can overtake the other's reads.
     auto position = commands_.begin();
     for (auto it = commands_.begin(); it != commands_.end(); ++it)
         if (changesRadio(*it) || (command.cat && it->cat && command.cat->request.client == it->cat->request.client))
@@ -216,6 +219,7 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
     {
         std::lock_guard lock(mutex_);
         bool release = job->request.name == "__release_client";
+        if (!release) lastCatRequest_ = Clock::now();
         if (stopping_ || (!releasesPtt(job->request) && commands_.size() >= 128)) {
             CatReply reply; reply.result = stopping_ ? -RIG_EIO : -RIG_ELIMIT;
             job->reply.set_value(std::move(reply)); return future;
@@ -227,7 +231,8 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
                 pending.cat->cancelled = true;
             commands_.push_front(std::move(command));
         } else if (releasesPtt(command.cat->request)) commands_.push_front(std::move(command));
-        else if (changesRadio(command)) queueInteractive(std::move(command));
+        // Each socket has at most one outstanding job. Give both NET clients
+        // their turn; repeated writes must not jump another client's reads.
         else commands_.push_back(std::move(command));
     }
     wake_.notify_one();
@@ -235,6 +240,7 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
 }
 void Worker::publish() { state_.dashboardPtt = heldPtt_; update_(state_); }
 int Worker::releaseTransmit(const std::string& reason) {
+    invalidateReadbacks();
     const int result = rig_set_ptt(rig_, RIG_VFO_CURR, RIG_PTT_OFF);
     report(reason, result);
     state_.releasePending = result != RIG_OK;
@@ -354,6 +360,7 @@ void Worker::run() {
     disconnect();
 }
 void Worker::disconnect() {
+    invalidateReadbacks();
     if (rig_) {
         if (heldPtt_ || catPttOwner_ || state_.releasePending) releaseTransmit("Disconnect PTT release");
         if (state_.portOpen) rig_close(rig_);
@@ -572,6 +579,14 @@ void Worker::read(Setting& s) {
     if (s.txOnly && (!state_.pttKnown || !state_.transmitting)) {
         s.valid = false; s.status = state_.pttKnown ? "TX only" : "TX status unavailable"; return;
     }
+    const auto began = Clock::now();
+    struct ReadTiming {
+        std::function<void()> report;
+        ~ReadTiming() { try { report(); } catch (...) {} }
+    } timing{[&] {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - began).count();
+        if (elapsed >= 200) log_("CAT sharing: background read " + s.id + " took " + std::to_string(elapsed) + " ms (" + s.status + ").");
+    }};
     value_t value{};
     char buffer[1024]{};
     if (s.type == ValueType::Text || (s.kind == Kind::Parameter && RIG_PARM_IS_STRING(s.mask))) value.s = buffer;
@@ -599,7 +614,7 @@ void Worker::read(Setting& s) {
         rptr_shift_t shift = RIG_RPT_SHIFT_NONE;
         if (s.id == "radio.RIT") { result = rig_get_rit(rig_, state_.settingsVfo, &offset); value.i = static_cast<int>(offset); }
         if (s.id == "radio.XIT") { result = rig_get_xit(rig_, state_.settingsVfo, &offset); value.i = static_cast<int>(offset); }
-        if (s.id == "radio.SPLIT") { result = rig_get_split_vfo(rig_, RIG_VFO_CURR, &split, &tx); value.i = split; }
+        if (s.id == "radio.SPLIT") { result = readSplit(RIG_VFO_CURR, &split, &tx); value.i = split; }
         if (s.id == "radio.STEP") { result = rig_get_ts(rig_, state_.settingsVfo, &offset); value.i = static_cast<int>(offset); }
         if (s.id == "radio.MEM") result = rig_get_mem(rig_, state_.settingsVfo, &value.i);
         if (s.id == "radio.CTCSS") { result = rig_get_ctcss_tone(rig_, state_.settingsVfo, &tone); value.i = static_cast<int>(tone); }
@@ -639,6 +654,7 @@ void Worker::read(Setting& s) {
     else s.value = std::to_string(value.i);
 }
 void Worker::write(Setting& s, const std::string& text) {
+    invalidateReadbacks();
     if (!s.writable) throw std::invalid_argument("This setting is read only.");
     value_t value{};
     bool string = s.type == ValueType::Text || (s.kind == Kind::Parameter && RIG_PARM_IS_STRING(s.mask));
@@ -751,6 +767,86 @@ bool Worker::urgentCommandPending() {
             return name.starts_with("set_") || name == "vfo_op" || name == "__release_client";
         });
 }
+bool Worker::catRecentlyActive() {
+    std::lock_guard lock(mutex_);
+    return lastCatRequest_ != Clock::time_point{} && Clock::now() - lastCatRequest_ < std::chrono::seconds(2);
+}
+void Worker::invalidateReadbacks() {
+    frequencies_.clear(); modes_.clear(); splits_.clear(); activeVfoReadback_ = {};
+}
+vfo_t Worker::readbackVfo(vfo_t vfo) const {
+    // Keep current-VFO readings separate: the front panel can switch VFO
+    // between transactions, so a previous get_vfo must not relabel B as A.
+    if (vfo == RIG_VFO_CURR) return RIG_VFO_CURR;
+    if (vfo == RIG_VFO_A || vfo == RIG_VFO_MAIN_A) return RIG_VFO_A;
+    if (vfo == RIG_VFO_B || vfo == RIG_VFO_MAIN_B) return RIG_VFO_B;
+    return RIG_VFO_NONE; // Ambiguous RX/TX targets always query Hamlib.
+}
+int Worker::readFrequency(vfo_t vfo, freq_t* frequency) {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return rig_get_freq(rig_, vfo, frequency);
+    const auto key = readbackVfo(vfo);
+    auto found = frequencies_.find(key);
+    if (key != RIG_VFO_NONE && found != frequencies_.end() && recentReadback(found->second.time)) {
+        *frequency = found->second.value; return RIG_OK;
+    }
+    const auto result = rig_get_freq(rig_, vfo, frequency);
+    if (key != RIG_VFO_NONE) {
+        if (result == RIG_OK) frequencies_[key] = {*frequency, Clock::now()};
+        else frequencies_.erase(key);
+    }
+    return result;
+}
+int Worker::readMode(vfo_t vfo, rmode_t* mode, pbwidth_t* width) {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return rig_get_mode(rig_, vfo, mode, width);
+    const auto key = readbackVfo(vfo);
+    auto found = modes_.find(key);
+    if (key != RIG_VFO_NONE && found != modes_.end() && recentReadback(found->second.time)) {
+        *mode = found->second.value.mode; *width = found->second.value.width; return RIG_OK;
+    }
+    const auto result = rig_get_mode(rig_, vfo, mode, width);
+    if (key != RIG_VFO_NONE) {
+        if (result == RIG_OK) modes_[key] = {{*mode, *width}, Clock::now()};
+        else modes_.erase(key);
+    }
+    return result;
+}
+int Worker::readActiveVfo(vfo_t* vfo) {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return rig_get_vfo(rig_, vfo);
+    if (recentReadback(activeVfoReadback_.time)) { *vfo = activeVfoReadback_.value; return RIG_OK; }
+    const auto result = rig_get_vfo(rig_, vfo);
+    if (result == RIG_OK) {
+        if (activeVfoReadback_.time != Clock::time_point{} && activeVfoReadback_.value != *vfo) {
+            frequencies_.clear(); modes_.clear(); splits_.clear();
+        }
+        activeVfoReadback_ = {*vfo, Clock::now()};
+    } else activeVfoReadback_ = {};
+    return result;
+}
+int Worker::readSplit(vfo_t vfo, split_t* split, vfo_t* tx) {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return rig_get_split_vfo(rig_, vfo, split, tx);
+    const auto key = vfo == RIG_VFO_CURR ? RIG_VFO_CURR : readbackVfo(vfo);
+    auto found = splits_.find(key);
+    if (key != RIG_VFO_NONE && found != splits_.end() && recentReadback(found->second.time)) {
+        *split = found->second.value.split; *tx = found->second.value.tx; return RIG_OK;
+    }
+    const auto result = rig_get_split_vfo(rig_, vfo, split, tx);
+    if (key != RIG_VFO_NONE) {
+        if (result == RIG_OK) splits_[key] = {{*split, *tx}, Clock::now()};
+        else splits_.erase(key);
+    }
+    return result;
+}
+int Worker::readVfoInfo(vfo_t vfo, freq_t* frequency, rmode_t* mode, pbwidth_t* width, split_t* split, int* sat) {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return rig_get_vfo_info(rig_, vfo, frequency, mode, width, split, sat);
+    // FT-710 targets both frequency and mode directly and has no SATMODE.
+    // Reuse the same confirmed readbacks as plain get_freq/get_mode clients.
+    auto result = readFrequency(vfo, frequency);
+    if (result == RIG_OK) result = readMode(vfo, mode, width);
+    vfo_t tx{};
+    if (result == RIG_OK) result = readSplit(RIG_VFO_CURR, split, &tx);
+    *sat = 0;
+    return result;
+}
 void Worker::resetPoll() {
     pollStage_ = PollStage::FrequencyA;
     controlIndex_ = fastIndex_ = 0;
@@ -770,7 +866,7 @@ bool Worker::pollControls() {
         {Kind::Level, RIG_LEVEL_MICGAIN}, {Kind::Level, RIG_LEVEL_SQL}, {Kind::Level, RIG_LEVEL_IF}
     }};
     while (controlIndex_ < controls.size()) {
-        if (urgentCommandPending()) return false;
+        if (commandPending() || urgentCommandPending()) return false;
         const auto [kind, mask] = controls[controlIndex_++];
         auto it = std::find_if(state_.settings.begin(), state_.settings.end(), [&](const Setting& s) {
             return s.kind == kind && s.mask == mask;
@@ -783,6 +879,7 @@ bool Worker::pollControls() {
     return true;
 }
 void Worker::markPoweredOff() {
+    invalidateReadbacks();
     resetPoll();
     const bool changed = !state_.poweredOff;
     state_.poweredOff = true; state_.powerKnown = true; state_.online = false; state_.standby = false;
@@ -827,8 +924,9 @@ bool Worker::poll() {
                 if (result == RIG_OK && power == RIG_POWER_ON) { state_.poweredOff = false; state_.powerKnown = true; }
             }
             freq_t frequency = 0;
-            auto result = rig_get_freq(rig_, RIG_VFO_A, &frequency);
+            auto result = readFrequency(RIG_VFO_A, &frequency);
             if (result != RIG_OK) {
+                invalidateReadbacks();
                 const auto details = "Frequency read: " + safe(rigerror(result));
                 // A frequency request does not work in standby. Check PS before
                 // publishing an error, including when the front-panel power changed.
@@ -868,7 +966,7 @@ bool Worker::poll() {
         }
         case PollStage::ActiveVfo: {
             vfo_t active{};
-            if (rig_get_vfo(rig_, &active) == RIG_OK) state_.activeVfo = active;
+            if (readActiveVfo(&active) == RIG_OK) state_.activeVfo = active;
             pollStage_ = PollStage::Meters;
             break;
         }
@@ -881,26 +979,26 @@ bool Worker::poll() {
             pollStage_ = PollStage::FrequencyB;
             break;
         case PollStage::FrequencyB:
-            state_.b.frequencyValid = rig_get_freq(rig_, RIG_VFO_B, &state_.b.frequency) == RIG_OK;
+            state_.b.frequencyValid = readFrequency(RIG_VFO_B, &state_.b.frequency) == RIG_OK;
             pollStage_ = PollStage::ModeA;
             break;
         case PollStage::ModeA: {
             rmode_t mode{}; pbwidth_t width{};
-            state_.a.modeValid = rig_get_mode(rig_, RIG_VFO_A, &mode, &width) == RIG_OK;
+            state_.a.modeValid = readMode(RIG_VFO_A, &mode, &width) == RIG_OK;
             if (state_.a.modeValid) { state_.a.mode = safe(rig_strrmode(mode)); state_.a.width = width; }
             pollStage_ = PollStage::ModeB;
             break;
         }
         case PollStage::ModeB: {
             rmode_t mode{}; pbwidth_t width{};
-            state_.b.modeValid = rig_get_mode(rig_, RIG_VFO_B, &mode, &width) == RIG_OK;
+            state_.b.modeValid = readMode(RIG_VFO_B, &mode, &width) == RIG_OK;
             if (state_.b.modeValid) { state_.b.mode = safe(rig_strrmode(mode)); state_.b.width = width; }
             pollStage_ = PollStage::Functions;
             break;
         }
         case PollStage::Functions:
             while (fastIndex_ < state_.settings.size()) {
-                if (urgentCommandPending()) { publish(); return false; }
+                if (pending()) { publish(); return false; }
                 auto& s = state_.settings[fastIndex_++];
                 if (!fast(s) || (s.kind == Kind::Function && (s.mask == RIG_FUNC_NR || s.mask == RIG_FUNC_NB)) ||
                     (s.kind == Kind::Level &&
@@ -914,15 +1012,26 @@ bool Worker::poll() {
             pollStage_ = PollStage::Slow;
             break;
         case PollStage::Slow: {
+            // A budget checked AFTER read() cannot bound a multi-transaction
+            // Hamlib call. Keep that optional sweep off the serial path while
+            // NET clients are polling; the core/quick controls still refresh.
+            const bool defer = catRecentlyActive() && !forceSlowBatch_;
+            if (defer != slowScanDeferred_) {
+                slowScanDeferred_ = defer;
+                log_(defer ? "CAT sharing: extended settings sweep deferred while a NET client is active; core controls and meters continue." :
+                    "CAT sharing: extended settings sweep resumed.");
+            }
+            if (defer) { resetPoll(); publish(); return true; }
             // Keep slow scans bounded so one large capability table cannot block UI commands.
             auto deadline = Clock::now() + std::chrono::milliseconds(160);
             for (int count = 0; count < 4 && !state_.settings.empty(); ++count) {
-                if (urgentCommandPending()) { publish(); return false; }
+                if (pending()) { publish(); return false; }
                 auto& s = state_.settings[slowIndex_++ % state_.settings.size()];
                 if (!fast(s) && s.kind != Kind::Configuration && !(s.kind == Kind::Level && isMeter(s.mask))) read(s);
                 { std::lock_guard lock(mutex_); if (!commands_.empty() || stopping_) break; }
                 if (Clock::now() > deadline) break;
             }
+            forceSlowBatch_ = false;
             resetPoll(); publish();
             return true;
         }
@@ -931,6 +1040,7 @@ bool Worker::poll() {
     }
 }
 int Worker::power(bool on) {
+    invalidateReadbacks();
     if (on && (heldPtt_ || catPttOwner_ || state_.releasePending || state_.transmitting)) {
         report("Power on is unavailable during TX or a pending PTT release",-RIG_ERJCTED);publish();return -RIG_ERJCTED;
     }
@@ -956,6 +1066,7 @@ void Worker::execute(const Command& command) {
     if (command.action == Action::Connect) { connect(command.connection); return; }
     if (command.action == Action::Disconnect) { disconnect(); log_("Disconnected"); return; }
     if (command.generation && command.generation != state_.generation) return;
+    if (changesRadio(command) || command.action == Action::Refresh) invalidateReadbacks();
     // No snapshots are published during these synchronous calls. Recording
     // the revision here acknowledges both success and the exception path.
     if (command.uiRequest) {
@@ -980,7 +1091,7 @@ void Worker::execute(const Command& command) {
         for (auto& s : state_.settings) if (s.kind != Kind::Configuration) { s.valid = false; s.status = "Waiting for selected VFO"; }
         slowIndex_ = 0; publish(); return;
     }
-    if (command.action == Action::Refresh) { slowIndex_ = 0; resetPoll(); poll(); return; }
+    if (command.action == Action::Refresh) { slowIndex_ = 0; forceSlowBatch_ = true; resetPoll(); poll(); return; }
     if (!state_.online || state_.busy) throw std::runtime_error("The radio is not responding. Use Power on or reconnect.");
     int result = -RIG_ENAVAIL;
     switch (command.action) {
@@ -1002,7 +1113,7 @@ void Worker::execute(const Command& command) {
         result = rig_set_freq(rig_, command.vfo, frequency);
         if (result == RIG_OK) {
             auto& vfo = command.vfo == RIG_VFO_B ? state_.b : state_.a;
-            vfo.frequencyValid = rig_get_freq(rig_, command.vfo, &vfo.frequency) == RIG_OK;
+            vfo.frequencyValid = readFrequency(command.vfo, &vfo.frequency) == RIG_OK;
         }
         break;
     }
@@ -1014,14 +1125,14 @@ void Worker::execute(const Command& command) {
         if (result == RIG_OK) {
             auto& vfo = command.vfo == RIG_VFO_B ? state_.b : state_.a;
             rmode_t actualMode{}; pbwidth_t actualWidth{};
-            vfo.modeValid = rig_get_mode(rig_, command.vfo, &actualMode, &actualWidth) == RIG_OK;
+            vfo.modeValid = readMode(command.vfo, &actualMode, &actualWidth) == RIG_OK;
             if (vfo.modeValid) { vfo.mode = safe(rig_strrmode(actualMode)); vfo.width = actualWidth; }
         }
         break;
     }
     case Action::SelectVfo:
         result = rig_set_vfo(rig_, command.vfo);
-        if (result == RIG_OK) rig_get_vfo(rig_, &state_.activeVfo);
+        if (result == RIG_OK) readActiveVfo(&state_.activeVfo);
         break;
     case Action::Swap: result = rig_vfo_op(rig_, RIG_VFO_CURR, RIG_OP_XCHG); break;
     case Action::CopyAtoB: result = rig_vfo_op(rig_, RIG_VFO_CURR, RIG_OP_CPY); break;
@@ -1066,6 +1177,7 @@ void Worker::execute(const Command& command) {
         }
     case Action::RawQuery:
     case Action::RawWrite: {
+        invalidateReadbacks(); // Raw console input can contain a radio write.
         if (connection_.type != ConnectionType::Serial)
             throw std::invalid_argument("The raw FT-710 CAT console requires a direct serial connection.");
         const auto& text = command.text;

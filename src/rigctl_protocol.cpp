@@ -153,6 +153,7 @@ CatReply Worker::executeCat(const CatRequest& request) {
     };
     if (request.generation != state_.generation || !rig_ || !state_.portOpen || connection_.type == ConnectionType::Network)
         return fail(-RIG_EIO);
+    if (name.starts_with("set_") || name == "vfo_op") invalidateReadbacks();
     if (name == "__release_client") {
         if (catPttOwner_ == request.client) {
             reply.result = releaseTransmit("Release PTT for disconnected CAT client " + std::to_string(request.client));
@@ -212,16 +213,16 @@ CatReply Worker::executeCat(const CatRequest& request) {
     if (state_.poweredOff) return fail(-RIG_EPOWER);
     bool setting = name.starts_with("set_") || name == "vfo_op";
     if (name == "get_freq") {
-        need(0); freq_t frequency{}; reply.result = rig_get_freq(rig_, vfo, &frequency); add("Frequency", std::to_string(static_cast<long long>(std::llround(frequency))));
+        need(0); freq_t frequency{}; reply.result = readFrequency(vfo, &frequency); add("Frequency", std::to_string(static_cast<long long>(std::llround(frequency))));
     } else if (name == "set_freq") {
         need(1); reply.result = rig_set_freq(rig_, vfo, frequencyValue(args[0]));
     } else if (name == "get_mode") {
-        need(0); rmode_t mode{}; pbwidth_t width{}; reply.result = rig_get_mode(rig_, vfo, &mode, &width);
+        need(0); rmode_t mode{}; pbwidth_t width{}; reply.result = readMode(vfo, &mode, &width);
         add("Mode", clean(rig_strrmode(mode))); add("Passband", std::to_string(width));
     } else if (name == "set_mode") {
         need(2); reply.result = rig_set_mode(rig_, vfo, modeValue(args[0]), widthValue(args[1]));
     } else if (name == "get_vfo") {
-        need(0); vfo_t current{}; reply.result = rig_get_vfo(rig_, &current); add("VFO", clean(rig_strvfo(current)));
+        need(0); vfo_t current{}; reply.result = readActiveVfo(&current); add("VFO", clean(rig_strvfo(current)));
     } else if (name == "set_vfo") {
         need(1); reply.result = rig_set_vfo(rig_, vfoValue(args[0]));
     } else if (name == "get_ptt") {
@@ -236,7 +237,7 @@ CatReply Worker::executeCat(const CatRequest& request) {
             state_.transmitting = status != 0; state_.pttKnown = true;
         }
     } else if (name == "get_split_vfo") {
-        need(0); split_t split{}; vfo_t tx{}; reply.result = rig_get_split_vfo(rig_, vfo, &split, &tx);
+        need(0); split_t split{}; vfo_t tx{}; reply.result = readSplit(vfo, &split, &tx);
         add("Split", std::to_string(split)); add("TX VFO", clean(rig_strvfo(tx)));
     } else if (name == "set_split_vfo") {
         need(2); int split = integer(args[0]); if (split != 0 && split != 1) return fail(-RIG_EINVAL);
@@ -257,7 +258,7 @@ CatReply Worker::executeCat(const CatRequest& request) {
         need(3); reply.result = rig_set_split_freq_mode(rig_, vfo, frequencyValue(args[0]), modeValue(args[1]), widthValue(args[2]));
     } else if (name == "get_vfo_info") {
         need(1); freq_t frequency{}; rmode_t mode{}; pbwidth_t width{}; split_t split{}; int sat = 0;
-        reply.result = rig_get_vfo_info(rig_, vfoValue(args[0]), &frequency, &mode, &width, &split, &sat);
+        reply.result = readVfoInfo(vfoValue(args[0]), &frequency, &mode, &width, &split, &sat);
         add("Freq", std::to_string(static_cast<long long>(std::llround(frequency)))); add("Mode", clean(rig_strrmode(mode)));
         add("Width", std::to_string(width)); add("Split", std::to_string(split)); add("SatMode", std::to_string(sat));
     } else if (name == "get_rig_info") {

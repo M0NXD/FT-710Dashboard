@@ -101,6 +101,15 @@ private:
     std::size_t slowIndex_ = 0;
     std::size_t meterIndex_ = 0;
     std::size_t controlIndex_ = 0, fastIndex_ = 0;
+    std::chrono::steady_clock::time_point lastCatRequest_{}; // mutex_ held
+    bool slowScanDeferred_ = false, forceSlowBatch_ = false;
+    template<class T> struct Readback { T value{}; std::chrono::steady_clock::time_point time{}; };
+    struct ModeReadback { rmode_t mode{}; pbwidth_t width{}; };
+    struct SplitReadback { split_t split{}; vfo_t tx{}; };
+    std::map<vfo_t, Readback<freq_t>> frequencies_;
+    std::map<vfo_t, Readback<ModeReadback>> modes_;
+    std::map<vfo_t, Readback<SplitReadback>> splits_;
+    Readback<vfo_t> activeVfoReadback_;
     enum class PollStage { FrequencyA, ActiveVfo, Meters, Controls, FrequencyB, ModeA, ModeB, Functions, Slow };
     PollStage pollStage_ = PollStage::FrequencyA;
     int missed_ = 0;
@@ -109,7 +118,7 @@ private:
     std::chrono::steady_clock::time_point pttDeadline_{};
     std::chrono::steady_clock::time_point releaseDeadline_{};
     int releaseTransmit(const std::string& reason);
-    void queueInteractive(Command command); // mutex_ held; preserve writes and this client's command order.
+    void queueInteractive(Command command); // mutex_ held; prioritize GUI actions without reordering writes.
     void run();
     void execute(const Command& command);
     void connect(const Connection& connection);
@@ -119,6 +128,14 @@ private:
     void pollMeters(bool publishUpdate = true);
     bool pollControls();
     bool urgentCommandPending();
+    bool catRecentlyActive();
+    void invalidateReadbacks(); // Radio worker only; called before every write.
+    vfo_t readbackVfo(vfo_t vfo) const;
+    int readFrequency(vfo_t vfo, freq_t* frequency);
+    int readMode(vfo_t vfo, rmode_t* mode, pbwidth_t* width);
+    int readActiveVfo(vfo_t* vfo);
+    int readSplit(vfo_t vfo, split_t* split, vfo_t* tx);
+    int readVfoInfo(vfo_t vfo, freq_t* frequency, rmode_t* mode, pbwidth_t* width, split_t* split, int* sat);
     void resetPoll();
     void read(Setting& setting);
     void write(Setting& setting, const std::string& value);
