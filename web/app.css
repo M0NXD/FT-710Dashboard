@@ -136,3 +136,5 @@
 .audio-recovery .inline{white-space:normal}
 .station-diagnostics{padding:14px;margin:12px 0}
 .station-diagnostics pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:.85rem}
+
+#browserAudio .audio-status{flex-wrap:wrap}#browserAudio .audio-status label{flex-wrap:wrap;max-width:100%}#clientMicLevel{min-width:9em;font-variant-numeric:tabular-nums;color:var(--mint)}

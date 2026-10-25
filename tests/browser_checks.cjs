@@ -4,6 +4,36 @@ const vm=require('node:vm');
 const path=require('node:path');
 const {PreferenceSaver,TuningQueue,RfHistory}=require('../web/control-core.js');
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function checkWorkletMicrophoneMeter(){
+  for(const rate of [44100,48000,96000]){
+    const messages=[];let Processor;
+    class Base {constructor(){this.port={postMessage:message=>messages.push(message)};}}
+    const context=vm.createContext({AudioWorkletProcessor:Base,sampleRate:rate,registerProcessor:(name,type)=>{assert.equal(name,'station-audio');Processor=type;}});
+    vm.runInContext(fs.readFileSync(path.join(__dirname,'../web/audio-worklet.js'),'utf8'),context);
+    const engine=new Processor(),input=new Float32Array(128),left=new Float32Array(128),right=new Float32Array(128);
+    const send=data=>engine.port.onmessage({data});
+    const run=(level,present=true)=>{input.fill(level);for(let i=0;i<Math.ceil(rate*.25/128);i++)engine.process(present?[[input]]:[[]],[[left,right]]);};
+    send({kind:'micGain',value:Math.pow(10,6/20)});run(.005);
+    let peak=messages.filter(message=>message.kind==='peak').at(-1);
+    assert.ok(peak?.inputPresent,'armed input produces meter samples with PTT off');
+    assert.ok(Math.abs(peak.inputPeak-.005)<.000001);
+    assert.ok(peak.value>.0095&&peak.value<.0101,'meter measures microphone boost before the PTT gate');
+    assert.equal(messages.some(message=>message.kind==='mic'),false,'meter testing must not produce transmit packets');
+    assert.ok(left.every(value=>value===0),'microphone must not feed receive playback');
+    send({kind:'micGain',value:4});run(.4);peak=messages.filter(message=>message.kind==='peak').at(-1);
+    assert.ok(peak.limited&&peak.value<=1&&peak.value>.85,'meter reports peak protection');
+    send({kind:'rx',samples:new Float32Array(20000).fill(.125)});send({kind:'listen',enabled:true});input.fill(.1);engine.process([[input]],[[left,right]]);
+    assert.ok(left.every(value=>value===.125)&&right.every(value=>value===.125),'mic gain leaves received audio unchanged');
+    send({kind:'gate',enabled:true,lease:7});run(.1);
+    const packets=messages.filter(message=>message.kind==='mic');assert.ok(packets.length>0,'simulated PTT opens packet gate');
+    assert.equal(new DataView(packets[0].buffer).getUint32(4,true),7);
+    send({kind:'gate',enabled:false,lease:0});run(0,false);
+    assert.equal(messages.filter(message=>message.kind==='mic').length,packets.length,'PTT off stops microphone packets');
+    peak=messages.filter(message=>message.kind==='peak').at(-1);
+    assert.equal(peak.inputPresent,false,'missing capture input is distinct from an active silent microphone');assert.equal(peak.value,0);
+  }
+  console.log('Microphone meter checks passed at 44.1/48/96 kHz: input and boost visible with PTT off, no transmit packets, bounded peaks, unchanged receive audio, missing-input detection.');
+}
 async function checkPlaybackMicWorkaround(){
   const nodes=new Map(),commands=[],gates=[],sessions=[],saved=new Map(),notices=[];
   const document={hidden:false,getElementById(id){if(!nodes.has(id))nodes.set(id,{value:'',checked:false,textContent:'',classList:{toggle(){}}});return nodes.get(id);}};
@@ -26,6 +56,14 @@ async function checkPlaybackMicWorkaround(){
   }}};
   const context=vm.createContext({console,document,navigator,PreferenceSaver,TuningQueue,RfHistory,performance,URLSearchParams,ArrayBuffer,DataView,Uint8Array,Uint8ClampedArray,Float32Array,Int16Array,setTimeout,clearTimeout,clearInterval,requestAnimationFrame:()=>{},window:{isSecureContext:true,AudioWorkletNode:function(){}},localStorage:{setItem:(key,value)=>saved.set(key,value)}});
   const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8');vm.runInContext(source.replace(/\bsetup\(\);\s*$/,''),context);
+  assert.ok(Math.abs(vm.runInContext('microphoneMeterReading(.005).db',context)+46.0206)<.001);
+  assert.ok(vm.runInContext('microphoneMeterReading(.01).level',context)>.4,'quiet phone speech must be visible on the dB scale');
+  assert.equal(vm.runInContext('microphoneMeterReading(0).level',context),0);
+  assert.equal(vm.runInContext('microphoneMeterReading(NaN).level',context),0);
+  vm.runInContext('micSource={};micStream={};microphone=true;micMeter={peak:.01,input:.005,present:true,limited:false,seen:performance.now()};renderMicrophoneMeter();',context);
+  assert.ok(get('clientMicPeak').value>.4);assert.match(get('clientMicLevel').textContent,/-40.0 dBFS/);assert.match(get('clientMicHint').textContent,/PTT not required/);
+  vm.runInContext('micMeter.seen=performance.now()-2000;renderMicrophoneMeter();',context);assert.match(get('clientMicLevel').textContent,/Waiting for mic samples/);
+  vm.runInContext('microphone=false;micSource=micStream=null;micMeter={peak:0,input:0,present:false,limited:false,seen:null};',context);
   assert.equal(vm.runInContext('browserPlaybackGain(100,0)',context),1);
   assert.equal(vm.runInContext('browserPlaybackGain(0,24)',context),0);
   assert.ok(Math.abs(vm.runInContext('browserPlaybackGain(100,6)',context)-1.995262)<.000001);
@@ -43,6 +81,7 @@ async function checkPlaybackMicWorkaround(){
   assert.ok(vm.runInContext('listeningGain.gain.value',context)>3.98);
   get('browserVolume').value='0';vm.runInContext('applyBrowserPlaybackLevel()',context);
   assert.equal(vm.runInContext('listeningGain.gain.value',context),0);
+  const actualEnsureReceive=vm.runInContext('ensureReceive',context);
   context.record=(action,fields)=>{commands.push({action,fields});return Promise.resolve({});};
   context.captureGate=message=>gates.push(message);
   context.recordNotice=message=>notices.push(message);
@@ -85,6 +124,24 @@ async function checkPlaybackMicWorkaround(){
   assert.equal(sessionType,'playback');assert.equal(get('playbackMicWorkaround').checked,true,'permission denial must not be misreported as a failed workaround');
   delete navigator.audioSession;vm.runInContext('audioSessionType(true)',context);
   assert.equal(vm.runInContext('playbackMicActive',context),false);
+  navigator.audioSession=session;failCapture=false;commands.length=0;
+  let completeMap;
+  context.record=(action,fields)=>{commands.push({action,fields});return action==='audioMap'?new Promise(resolve=>{completeMap=resolve;}):Promise.resolve({});};
+  vm.runInContext('command=record;',context);
+  const interruptedArm=vm.runInContext('armMicrophone()',context);
+  while(!completeMap)await wait(0);
+  vm.runInContext('stopClientAudio();client=3;socket={readyState:1};',context);
+  completeMap({});
+  await assert.rejects(interruptedArm,/Connection changed/);
+  assert.equal(commands.some(item=>item.action==='browserMic'&&item.fields.enabled==='1'),false,'obsolete mic arm must not register on a replacement connection');
+  assert.equal(track.stopped,true,'obsolete capture stream must be stopped');
+  commands.length=0;completeMap=null;
+  vm.runInContext("state.audio.maps[0]='radio:input';state.audio.maps[1]='';state.audio.receiveWanted=false;",context);
+  const interruptedListen=actualEnsureReceive();
+  while(!completeMap)await wait(0);
+  vm.runInContext('stopClientAudio();client=4;',context);completeMap({});
+  await assert.rejects(interruptedListen,/Connection changed/);
+  assert.equal(commands.some(item=>item.action==='audioRoute'),false,'obsolete listening setup must not open a route on the replacement session');
 }
 async function checkBrowserConnections(){
   const nodes=new Map(),timers=new Map(),windows=new Map(),documents=new Map(),connections=[],rendered=[],notices=[];
@@ -135,6 +192,10 @@ async function checkBrowserConnections(){
   document.getElementById('login').hidden=true;resolveProbe({status:401,ok:false});await probe;
   assert.equal(document.getElementById('login').hidden,true,'a stale reconnect probe must not replace a new connection with the login page');
   third.message({type:'state',generation:3});third.message({type:'heartbeat'});
+  const workingSend=third.send;third.send=()=>{throw new Error('Socket send failed');};
+  await assert.rejects(vm.runInContext("command('mode',{mode:'USB'},'mode')",context),/Socket send failed/);
+  assert.equal(vm.runInContext('pending.size+edits.size',context),0,'failed socket writes must clear command timers and editor locks immediately');
+  third.send=workingSend;
   vm.runInContext('microphone=listening=true;',context);third.message({type:'controlIdle'});
   assert.equal(vm.runInContext('microphone',context),false);assert.equal(vm.runInContext('listening',context),true,'control pause must not stop receive playback');
   vm.runInContext('installPageLifecycle()',context);now+=20000;pulse();assert.equal(third.readyState,1);
@@ -196,4 +257,5 @@ async function main(){
   assert.equal(vm.runInContext('pixelCalls',context),850);assert.equal(vm.runInContext('image.data[0]',context),20);assert.equal(vm.runInContext('image.data[850*4]',context),10);
   console.log('Browser checks passed: preference ordering/failure, tuning/cancellation, RF grids/freshness, mic ownership, page restoration, incremental waterfall pixels, playback-session ordering/capture/rejection/interruption recovery, playback boost/mute/peak guard, connection watchdog/reconnect races/stale sockets/idle mic release.');
 }
-main().catch(error=>{console.error(error);process.exitCode=1;});
+try{checkWorkletMicrophoneMeter();}catch(error){console.error(error);process.exitCode=1;}
+if(!process.exitCode)main().catch(error=>{console.error(error);process.exitCode=1;});

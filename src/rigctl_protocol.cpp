@@ -215,12 +215,15 @@ CatReply Worker::executeCat(const CatRequest& request) {
     if (name == "get_freq") {
         need(0); freq_t frequency{}; reply.result = readFrequency(vfo, &frequency); add("Frequency", std::to_string(static_cast<long long>(std::llround(frequency))));
     } else if (name == "set_freq") {
-        need(1); reply.result = rig_set_freq(rig_, vfo, frequencyValue(args[0]));
+        need(1); const auto frequency = frequencyValue(args[0]);
+        reply.result = confirmFrequency(rig_set_freq(rig_, vfo, frequency), vfo, frequency);
     } else if (name == "get_mode") {
         need(0); rmode_t mode{}; pbwidth_t width{}; reply.result = readMode(vfo, &mode, &width);
         add("Mode", clean(rig_strrmode(mode))); add("Passband", std::to_string(width));
     } else if (name == "set_mode") {
-        need(2); reply.result = rig_set_mode(rig_, vfo, modeValue(args[0]), widthValue(args[1]));
+        need(2); const auto mode = modeValue(args[0]); const auto width = widthValue(args[1]);
+        reply.result = prepareModeWrite();
+        if (reply.result == RIG_OK) reply.result = confirmMode(rig_set_mode(rig_, vfo, mode, width), vfo, mode);
     } else if (name == "get_vfo") {
         need(0); vfo_t current{}; reply.result = readActiveVfo(&current); add("VFO", clean(rig_strvfo(current)));
     } else if (name == "set_vfo") {
@@ -251,11 +254,19 @@ CatReply Worker::executeCat(const CatRequest& request) {
             reply.result = rig_get_split_mode(rig_, vfo, &mode, &width); add("TX Mode", clean(rig_strrmode(mode))); add("TX Passband", std::to_string(width));
         }
     } else if (name == "set_split_freq") {
-        need(1); reply.result = rig_set_split_freq(rig_, vfo, frequencyValue(args[0]));
+        need(1); const auto frequency = frequencyValue(args[0]);
+        reply.result = confirmFrequency(rig_set_split_freq(rig_, vfo, frequency), vfo, frequency, true);
     } else if (name == "set_split_mode") {
-        need(2); reply.result = rig_set_split_mode(rig_, vfo, modeValue(args[0]), widthValue(args[1]));
+        need(2); const auto mode = modeValue(args[0]); const auto width = widthValue(args[1]);
+        reply.result = prepareModeWrite();
+        if (reply.result == RIG_OK) reply.result = confirmMode(rig_set_split_mode(rig_, vfo, mode, width), vfo, mode, true);
     } else if (name == "set_split_freq_mode") {
-        need(3); reply.result = rig_set_split_freq_mode(rig_, vfo, frequencyValue(args[0]), modeValue(args[1]), widthValue(args[2]));
+        need(3); const auto frequency = frequencyValue(args[0]); const auto mode = modeValue(args[1]); const auto width = widthValue(args[2]);
+        reply.result = prepareModeWrite();
+        if (reply.result == RIG_OK) {
+            reply.result = confirmFrequency(rig_set_split_freq_mode(rig_, vfo, frequency, mode, width), vfo, frequency, true);
+            reply.result = confirmMode(reply.result, vfo, mode, true);
+        }
     } else if (name == "get_vfo_info") {
         need(1); freq_t frequency{}; rmode_t mode{}; pbwidth_t width{}; split_t split{}; int sat = 0;
         reply.result = readVfoInfo(vfoValue(args[0]), &frequency, &mode, &width, &split, &sat);

@@ -193,10 +193,8 @@ void Worker::submit(Command command) {
                 return;
             }
         }
-        if (command.action == Action::PttOff)
-            commands_.erase(std::remove_if(commands_.begin(), commands_.end(), [](const Command& pending) {
-                return pending.action == Action::PttOn;
-            }), commands_.end());
+        if (command.action == Action::PttOff || command.action == Action::Disconnect)
+            cancelPendingPttStarts();
         // Release requests have priority over queued UI operations.
         if (command.action == Action::PttOff || command.action == Action::Disconnect)
             commands_.push_front(std::move(command));
@@ -214,6 +212,14 @@ void Worker::queueInteractive(Command command) {
             position = std::next(it);
     commands_.insert(position, std::move(command));
 }
+void Worker::cancelPendingPttStarts() {
+    commands_.erase(std::remove_if(commands_.begin(), commands_.end(), [](const Command& pending) {
+        if (pending.cat && pending.cat->request.name == "set_ptt" &&
+            pending.cat->request.arguments.size() == 1 && pending.cat->request.arguments[0] != "0")
+            pending.cat->cancelled = true;
+        return pending.action == Action::PttOn;
+    }), commands_.end());
+}
 std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
     auto future = job->reply.get_future();
     {
@@ -230,7 +236,10 @@ std::future<CatReply> Worker::request(std::shared_ptr<CatJob> job) {
             for (auto& pending : commands_) if (pending.cat && pending.cat->request.client == command.cat->request.client)
                 pending.cat->cancelled = true;
             commands_.push_front(std::move(command));
-        } else if (releasesPtt(command.cat->request)) commands_.push_front(std::move(command));
+        } else if (releasesPtt(command.cat->request)) {
+            cancelPendingPttStarts();
+            commands_.push_front(std::move(command));
+        }
         // Each socket has at most one outstanding job. Give both NET clients
         // their turn; repeated writes must not jump another client's reads.
         else commands_.push_back(std::move(command));
@@ -258,7 +267,9 @@ void Worker::report(const std::string& operation, int result) {
         state_.error.clear();
     } else {
         state_.error = operation + ": " + briefError(result);
-        log_(operation + ": " + safe(rigerror(result)));
+        // rigerror() can include Hamlib's accumulated debug trace. Keep the
+        // activity stream bounded and readable, as with the status message.
+        log_(state_.error);
     }
 }
 void Worker::run() {
@@ -408,6 +419,11 @@ void Worker::connect(const Connection& connection) {
         config("retry", "0");
     }
     if (connection.type == ConnectionType::Serial) {
+        // The dashboard owns readback caching. Hamlib must not confirm a write
+        // using its optimistic set cache, or skip it after detecting knob motion.
+        config("twiddle_timeout", "0");
+        config("freq_skip", "0");
+        config("cache_timeout", "0");
         config("serial_speed", std::to_string(connection.baud));
         config("stop_bits", std::to_string(connection.stopBits));
         config("serial_handshake", connection.handshake);
@@ -426,6 +442,8 @@ void Worker::connect(const Connection& connection) {
     }
     state_.portOpen = true;
     if (connection.type == ConnectionType::Serial) {
+        // rig_open/backend setup may change the generic cache timeout again.
+        rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
         // The 4.7.2 FT-710 descriptor inherited 200 W / 75 W ranges from
         // another Yaesu. Correct this instance's advertised power ranges.
         auto& ranges = HAMLIB_STATE(rig_)->tx_range_list;
@@ -774,6 +792,54 @@ bool Worker::catRecentlyActive() {
 void Worker::invalidateReadbacks() {
     frequencies_.clear(); modes_.clear(); splits_.clear(); activeVfoReadback_ = {};
 }
+int Worker::prepareModeWrite() {
+    if (rig_->caps->rig_model != RIG_MODEL_FT710) return RIG_OK;
+    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    // rig_set_mode silently returns success when Hamlib's cached PTT is on.
+    // Refresh it even if a front-panel/USB PTT release happened between polls.
+    ptt_t ptt{};
+    const int result = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt);
+    if (result != RIG_OK) return result;
+    if (ptt != RIG_PTT_OFF) {
+        log_("Mode change rejected: the radio is transmitting; release PTT first.");
+        return -RIG_ERJCTED;
+    }
+    return RIG_OK;
+}
+int Worker::confirmFrequency(int result, vfo_t vfo, freq_t requested, bool split) {
+    if (result != RIG_OK || rig_->caps->rig_model != RIG_MODEL_FT710) return result;
+    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    invalidateReadbacks();
+    freq_t actual{};
+    result = split ? rig_get_split_freq(rig_, vfo, &actual) : rig_get_freq(rig_, vfo, &actual);
+    if (result == RIG_OK && std::abs(actual - requested) > .5) {
+        log_("Frequency change not applied: requested " + formatNumber(requested) +
+            " Hz, radio reports " + formatNumber(actual) + " Hz (" + safe(rig_strvfo(vfo)) + ").");
+        return -RIG_ERJCTED;
+    }
+    if (result == RIG_OK && !split) {
+        const auto key = readbackVfo(vfo);
+        if (key != RIG_VFO_NONE) frequencies_[key] = {actual, Clock::now()};
+    }
+    return result;
+}
+int Worker::confirmMode(int result, vfo_t vfo, rmode_t requested, bool split) {
+    if (result != RIG_OK || rig_->caps->rig_model != RIG_MODEL_FT710) return result;
+    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    invalidateReadbacks();
+    rmode_t actual{}; pbwidth_t width{};
+    result = split ? rig_get_split_mode(rig_, vfo, &actual, &width) : rig_get_mode(rig_, vfo, &actual, &width);
+    if (result == RIG_OK && actual != requested) {
+        log_("Mode change not applied: requested " + safe(rig_strrmode(requested)) +
+            ", radio reports " + safe(rig_strrmode(actual)) + " (" + safe(rig_strvfo(vfo)) + ").");
+        return -RIG_ERJCTED;
+    }
+    if (result == RIG_OK && !split) {
+        const auto key = readbackVfo(vfo);
+        if (key != RIG_VFO_NONE) modes_[key] = {{actual, width}, Clock::now()};
+    }
+    return result;
+}
 vfo_t Worker::readbackVfo(vfo_t vfo) const {
     // Keep current-VFO readings separate: the front panel can switch VFO
     // between transactions, so a previous get_vfo must not relabel B as A.
@@ -1110,7 +1176,7 @@ void Worker::execute(const Command& command) {
         }
         if (!std::isfinite(frequency) || frequency < 30000 || frequency > 60000000)
             throw std::invalid_argument("FT-710 receive frequency must be 0.030 to 60.000 MHz.");
-        result = rig_set_freq(rig_, command.vfo, frequency);
+        result = confirmFrequency(rig_set_freq(rig_, command.vfo, frequency), command.vfo, frequency);
         if (result == RIG_OK) {
             auto& vfo = command.vfo == RIG_VFO_B ? state_.b : state_.a;
             vfo.frequencyValid = readFrequency(command.vfo, &vfo.frequency) == RIG_OK;
@@ -1121,7 +1187,9 @@ void Worker::execute(const Command& command) {
         rmode_t mode = rig_parse_mode(command.text.c_str());
         if (mode == RIG_MODE_NONE || command.width < 0 || command.width > 100000)
             throw std::invalid_argument("Select a supported mode and a passband of 0 (normal) to 100000 Hz.");
-        result = rig_set_mode(rig_, command.vfo, mode, command.width);
+        result = prepareModeWrite();
+        if (result == RIG_OK)
+            result = confirmMode(rig_set_mode(rig_, command.vfo, mode, command.width), command.vfo, mode);
         if (result == RIG_OK) {
             auto& vfo = command.vfo == RIG_VFO_B ? state_.b : state_.a;
             rmode_t actualMode{}; pbwidth_t actualWidth{};

@@ -369,9 +369,19 @@ void Server::websocket(Client& client, Stream& stream, std::string input, const 
             }
             try {
                 auto fields = form(payload); auto action = fields["action"], seq = fields["seq"];
-                if (action == "heartbeat") { alive = send(1,"{\"type\":\"heartbeat\"}"); continue; }
+                if (action == "heartbeat") {
+                    std::string reply = "{\"type\":\"heartbeat\"";
+                    auto marker = fields.find("resumeMic");
+                    if (marker != fields.end() && marker->second.size() <= 32) reply += ",\"resumeMic\":" + json(marker->second);
+                    alive = send(1,reply + "}"); continue;
+                }
                 if (now - commandPeriod >= 1000) { commandPeriod = now; commands = 0; }
-                if (++commands > 40 || pending.size() >= 16) throw std::runtime_error("Too many pending commands");
+                const bool release = (action == "ptt" || action == "browserMic") && fields["enabled"] == "0";
+                // Reserve queue capacity for release even after an ordinary
+                // command burst. A release flood closes the session, whose
+                // cleanup independently releases this browser's PTT/mic.
+                if (release && pending.size() >= 32) { close(1008,"Too many pending release commands"); alive = false; break; }
+                if (!release && (++commands > 40 || pending.size() >= 16)) throw std::runtime_error("Too many pending commands");
                 if (action == "subscribe") { audioScope = fields["audio"] == "1"; rfScope = fields["rf"] == "1"; spectrumRevision = rfSpectrumRevision = ~0ULL; alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
                 if (action == "listen") { listening = fields["enabled"] == "1"; cursor = 0; epoch = ~0ULL; alive = send(1,"{\"type\":\"ack\",\"seq\":" + json(seq) + ",\"ok\":true}"); continue; }
                 auto request = std::make_shared<Request>(); request->client = client.id; request->accessRevision = accessRevision; request->fields = std::move(fields);

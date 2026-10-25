@@ -37,6 +37,14 @@ async function main(){
   sendFrame(socket,1,'action=fix',false);sendFrame(socket,9,'between fragments');sendFrame(socket,0,'ture&seq=fragment&generation=1');
   await until(()=>messages.some(x=>x.type==='ack'&&x.seq==='fragment'&&x.fixture));
   assert.ok(messages.some(x=>x.binary===10),'interleaved ping must receive pong');
+  for(let i=0;i<45;i++)send('action=fixture&seq=burst-'+i+'&generation=1');
+  send('action=ptt&enabled=0&seq=release-burst&generation=1');
+  send('action=browserMic&enabled=0&seq=disarm-burst&generation=1');
+  await until(()=>messages.some(x=>x.type==='ack'&&x.seq==='disarm-burst'));
+  assert.equal(messages.find(x=>x.seq==='release-burst')?.ok,true,'PTT off must bypass the ordinary command burst limit');
+  assert.equal(messages.find(x=>x.seq==='disarm-burst')?.ok,true,'mic disarm must bypass the ordinary command burst limit');
+  assert.ok(messages.some(x=>x.seq?.startsWith('burst-')&&x.ok===false),'ordinary command burst remains limited');
+  await wait(1100);
   send('action=heartbeat');await until(()=>messages.some(x=>x.type==='heartbeat'));
   socket.pause();fixture.stdin.write('FLOOD\n');await until(()=>output.includes('buffered output'),5000);
   send('action=fixture&seq=while-paused&generation=1');

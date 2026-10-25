@@ -36,6 +36,8 @@ bool sendAll(SOCKET socket, const std::string& text) {
 class Ft710Fixture {
 public:
     std::atomic<bool> transmitting{true};
+    std::atomic<bool> ignoreFrequency{false}, ignoreMode{false};
+    std::atomic<bool> holdPttRead{false}, pttReadBlocked{false};
     std::atomic<int> power{50}, vfoWrites{0}, meterReads{0}, filterWrites{0};
     std::atomic<int> frequencyA{14200000}, frequencyB{7074000};
     std::atomic<int> activeVfo{0}, split{0};
@@ -80,6 +82,7 @@ private:
             return value;
         }
         if (command.size() == 11 && (command.starts_with("FA") || command.starts_with("FB"))) {
+            if (ignoreFrequency) return {};
             (command.starts_with("FA") ? frequencyA : frequencyB) = std::stoi(command.substr(2)); return {};
         }
         if (command == "IF" || command == "OI") {
@@ -90,7 +93,10 @@ private:
         }
         if (command == "VS") return "VS" + std::to_string(activeVfo.load()) + ";";
         if (command.size() == 3 && command.starts_with("VS")) { ++vfoWrites; activeVfo = command[2] - '0'; return {}; }
-        if (command == "TX") return transmitting ? "TX2;" : "TX0;";
+        if (command == "TX") {
+            if (holdPttRead) { pttReadBlocked = true; while (holdPttRead && !stopping_) std::this_thread::sleep_for(1ms); pttReadBlocked = false; }
+            return transmitting ? "TX2;" : "TX0;";
+        }
         if (command.starts_with("TX")) { transmitting = command != "TX0"; return {}; }
         if (command == "PC") {
             char value[16]{}; std::snprintf(value, sizeof value, "PC%03d;", power.load()); return value;
@@ -98,6 +104,7 @@ private:
         if (command.starts_with("PC") && command.size() == 5) { power = std::stoi(command.substr(2)); return {}; }
         if (command == "MD0" || command == "MD1") return command + mode.load() + ";";
         if (command.size() == 4 && (command.starts_with("MD0") || command.starts_with("MD1"))) {
+            if (ignoreMode) return {};
             mode = command[3]; return {};
         }
         if (command == "SH0" || command == "SH1") return command + "013;";
@@ -278,9 +285,33 @@ int main() {
             std::cout << "PASS background radio polling progresses during sustained CAT traffic\n";
             // WS/WSJT-X sends this exact request when entering data mode:
             // M VFOA PKTUSB -1. The sentinel means retain the radio's filter.
-            require(client.command("M VFOA PKTUSB -1") == "RPRT 0", "WSJT-X data mode with unchanged filter");
+            fixture.transmitting = true;
+            require(client.command("t VFOA") == "1", "Fixture TX state not read");
+            fixture.transmitting = false;
+            const auto dataModeReply = client.command("M VFOA PKTUSB -1");
+            if (dataModeReply != "RPRT 0") { std::lock_guard lock(mutex); for (const auto& line : logs) std::cerr << line << '\n'; }
+            require(dataModeReply == "RPRT 0", "WSJT-X data mode with unchanged filter: " + dataModeReply);
             wait([&](const auto&) { return fixture.saw("MD0C"); }, "Data mode was not sent to the FT-710 backend");
             require(fixture.mode == 'C', "Data mode not applied");
+            fixture.transmitting = true;
+            require(client.command("M VFOA USB -1") == "RPRT -9", "Mode change during TX silently accepted");
+            require(fixture.mode == 'C', "Mode changed during TX");
+            fixture.transmitting = false;
+            fixture.ignoreMode = true;
+            require(client.command("M VFOA USB -1") == "RPRT -9", "Ignored mode write reported success");
+            fixture.ignoreMode = false;
+            require(client.command("M VFOA USB -1") == "RPRT 0", "Mode did not recover after ignored write");
+            require(fixture.mode == '2', "USB mode not applied");
+            require(client.command("M VFOA PKTUSB -1") == "RPRT 0", "Data mode did not recover");
+            fixture.ignoreFrequency = true;
+            require(client.command("F VFOA 14076000") != "RPRT 0", "Ignored frequency write reported success");
+            fixture.ignoreFrequency = false;
+            require(client.command("F VFOA 14076000") == "RPRT 0", "Frequency did not recover after ignored write");
+            require(fixture.frequencyA == 14076000, "Frequency not applied");
+            fixture.frequencyA = 14077000; // Front-panel change between client requests.
+            require(client.command("F VFOA 14074000") == "RPRT 0", "Front-panel change suppressed client tuning");
+            require(fixture.frequencyA == 14074000, "Frequency after front-panel change not applied");
+            std::cout << "PASS mode changes refresh stale TX state; ignored frequency/mode writes fail honestly and recover\n";
             const auto splitReply = client.command("X VFOA PKTUSB -1");
             require(splitReply == "RPRT 0", "Split mode with unchanged filter: " + splitReply);
             const auto combinedReply = client.command("K VFOA 14075000 PKTUSB -1");
@@ -290,6 +321,21 @@ int main() {
             require(client.command("K VFOA 14075000 PKTUSB -2") == "RPRT -1", "Accepted invalid combined split passband");
             require(fixture.filterWrites == 0, "Unchanged-filter request changed the radio's filter");
             std::cout << "PASS WSJT-X data mode and split requests retain the filter; invalid passbands still rejected\n";
+            auto job = [&](const char* name, std::vector<std::string> arguments) {
+                auto request = std::make_shared<radio::CatJob>(); request->request.name = name;
+                request->request.arguments = std::move(arguments); request->request.generation = current().generation;
+                request->request.client = 999; return worker.request(request);
+            };
+            fixture.holdPttRead = true;
+            auto blocked = job("get_ptt", {});
+            wait([&](const auto&) { return fixture.pttReadBlocked.load(); }, "Could not hold simulated PTT read");
+            auto start = job("set_ptt", {"1"});
+            auto release = job("set_ptt", {"0"});
+            fixture.holdPttRead = false;
+            check(blocked.get().result, "Held read"); check(release.get().result, "Queued release");
+            require(start.get().result != RIG_OK, "Release allowed an older queued CAT PTT-on to execute");
+            require(!fixture.transmitting, "Older queued PTT-on keyed after release");
+            std::cout << "PASS priority PTT release cancels older queued CAT transmit starts\n";
         }
         server.stop();
         worker.stop();

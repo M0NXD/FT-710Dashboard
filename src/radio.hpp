@@ -118,6 +118,7 @@ private:
     std::chrono::steady_clock::time_point pttDeadline_{};
     std::chrono::steady_clock::time_point releaseDeadline_{};
     int releaseTransmit(const std::string& reason);
+    void cancelPendingPttStarts(); // mutex_ held; keep CAT promises for cancellation replies.
     void queueInteractive(Command command); // mutex_ held; prioritize GUI actions without reordering writes.
     void run();
     void execute(const Command& command);
@@ -130,6 +131,9 @@ private:
     bool urgentCommandPending();
     bool catRecentlyActive();
     void invalidateReadbacks(); // Radio worker only; called before every write.
+    int prepareModeWrite();
+    int confirmFrequency(int result, vfo_t vfo, freq_t requested, bool split = false);
+    int confirmMode(int result, vfo_t vfo, rmode_t requested, bool split = false);
     vfo_t readbackVfo(vfo_t vfo) const;
     int readFrequency(vfo_t vfo, freq_t* frequency);
     int readMode(vfo_t vfo, rmode_t* mode, pbwidth_t* width);

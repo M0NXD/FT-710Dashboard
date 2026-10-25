@@ -3,6 +3,8 @@ class StationAudio extends AudioWorkletProcessor {
     super(); this.rx = new Float32Array(32768); this.read = 0; this.write = 0; this.phase = 0; this.buffering = true;
     this.listen = false; this.gate = false; this.lease = 0; this.micPosition = 0; this.micNext = 0; this.previous = 0; this.havePrevious = false;
     this.mic = new Int16Array(960); this.micCount = 0; this.peak = 0; this.peakFrames = 0;
+    this.inputPeak = 0; this.inputPresent = false; this.limited = false;
+    this.micGain = this.micGainTarget = 1; this.micGainStep = 1 - Math.exp(-1 / (sampleRate * .01));
     this.port.onmessage = ({data}) => {
       if (data.kind === 'rx') {
         if (this.write - this.read + data.samples.length >= 32768 || data.reset) this.resetRx();
@@ -10,6 +12,10 @@ class StationAudio extends AudioWorkletProcessor {
         if (this.write - this.read > 7200) { this.read = this.write - 2880; this.phase = 0; }
       } else if (data.kind === 'listen') { this.listen = data.enabled; if (!this.listen) this.resetRx(); }
       else if (data.kind === 'reset') this.resetRx();
+      else if (data.kind === 'micGain') {
+        const value = Number(data.value);
+        this.micGainTarget = Number.isFinite(value) ? Math.max(0, Math.min(16, value)) : 1;
+      }
       else if (data.kind === 'gate') {
         if (this.gate !== data.enabled || this.lease !== data.lease) { this.micCount = 0; this.havePrevious = false; this.micPosition = this.micNext = 0; }
         this.gate = data.enabled; this.lease = data.lease;
@@ -27,9 +33,19 @@ class StationAudio extends AudioWorkletProcessor {
   }
   process(inputs, outputs) {
     const input = inputs[0]?.[0], output = outputs[0]?.[0]; if (!output) return true;
+    this.inputPresent = this.inputPresent || !!input?.length;
     const rxStep = 48000 / sampleRate, micStep = sampleRate / 48000;
     for (let i = 0; i < output.length; i++) {
-      const sample = input ? input[i] || 0 : 0; this.peak = Math.max(this.peak, Math.abs(sample));
+      // Smooth manual gain over 10 ms. Apply it before both the meter and
+      // gated microphone packets; the receive/playback samples stay separate.
+      this.micGain += (this.micGainTarget - this.micGain) * this.micGainStep;
+      const incoming = input ? input[i] || 0 : 0, raw = Number.isFinite(incoming) ? incoming : 0;
+      this.inputPeak = Math.max(this.inputPeak, Math.abs(raw));
+      const value = raw * this.micGain;
+      const magnitude = Math.abs(value);
+      if(magnitude > .85)this.limited = true;
+      const sample = !Number.isFinite(value) ? 0 : magnitude <= .85 ? value : Math.sign(value) * (.85 + .15 * Math.tanh((magnitude - .85) / .15));
+      this.peak = Math.max(this.peak, Math.abs(sample));
       if (this.gate && input) {
         if (!this.havePrevious) { this.micSample(sample); this.previous = sample; this.havePrevious = true; this.micNext = micStep; this.micPosition = 1; }
         else {
@@ -47,7 +63,10 @@ class StationAudio extends AudioWorkletProcessor {
     }
     for (let channel = 1; channel < outputs[0].length; channel++) outputs[0][channel].set(output);
     this.peakFrames += output.length;
-    if (this.peakFrames >= sampleRate / 10) { this.port.postMessage({kind:'peak',value:this.peak}); this.peak = this.peakFrames = 0; }
+    if (this.peakFrames >= sampleRate / 10) {
+      this.port.postMessage({kind:'peak',value:this.peak,inputPeak:this.inputPeak,inputPresent:this.inputPresent,limited:this.limited});
+      this.peak = this.inputPeak = this.peakFrames = 0; this.inputPresent = this.limited = false;
+    }
     return true;
   }
 }

@@ -5,6 +5,8 @@ let audioContext, audioSetup, audioNode, listeningGain, micStream, micSource, li
 let audioEpoch = 0, microphoneBusy = false, listeningBusy = false, rfCaptureAction = '', rfCaptureTimer, rfCaptureBaselineStatus = '';
 let preferenceSaver, tuningQueue, activePage='dashboard', renderScheduled=false, renderCost=0, lastCommandMs=0, micRegistered=false;
 let playbackMicActive=false;
+let micMeter={peak:0,input:0,present:false,limited:false,seen:null};
+let microphoneReturn=null,stateRevision=0,microphoneReturnProbe=0;
 let connectionTimer,connectionRevision=0,lastDisconnect='None';
 let tunerClickTimer=0, tunerClickGeneration=0;
 const rfHistory=new RfHistory(), waterfallCaches=new Map();
@@ -58,7 +60,8 @@ function command(action, fields={}, editKey) {
   const seq=String(++sequence), payload=new URLSearchParams({action,seq,generation:String(state.generation),...fields});
   return new Promise((resolve,reject)=>{
     const timer=setTimeout(()=>{ pending.delete(seq); if(editKey&&edits.get(editKey)?.seq===seq) edits.delete(editKey); reject(new Error('No command acknowledgement; check the station connection')); },10000);
-    pending.set(seq,{resolve,reject,timer,editKey,sent:performance.now()}); if(editKey) edits.set(editKey,{seq,revision:null,until:Date.now()+12000}); socket.send(payload.toString());
+    pending.set(seq,{resolve,reject,timer,editKey,sent:performance.now()}); if(editKey) edits.set(editKey,{seq,revision:null,until:Date.now()+12000});
+    try{socket.send(payload.toString());}catch(error){clearTimeout(timer);pending.delete(seq);if(editKey&&edits.get(editKey)?.seq===seq)edits.delete(editKey);reject(error);}
   });
 }
 const preferenceIds=['connectionKind','endpoint','baud','stopBits','flow','poll','rfSpan','rfCat2Port','rfCat2Baud','rfWaterfallLevel'];
@@ -173,7 +176,7 @@ function initializeCards() {
   });
 }
 function render(next) {
-  const previous=state;state=next;const live=state.online&&!state.busy, tx=state.pttKnown&&state.transmitting;
+  const previous=state;state=next;++stateRevision;const live=state.online&&!state.busy, tx=state.pttKnown&&state.transmitting;
   if(!live||tunerClickGeneration!==state.generation)cancelTunerClick();
   if(previous && previous.generation!==state.generation) { edits.clear();for(const key of [...dirty])if(!preferenceSaver?.versions.has(key))dirty.delete(key);tuningQueue?.clear();stopClientAudio();scopeRows=[];scopeBins=null;scopePeaks=null;scopeGeneration=-1;rfHistory.clear();rfRows=[];rfBins=null; }
   const off=(state.poweredOff||state.standby)&&!state.busy,status=off?'Powered off':state.status;
@@ -226,7 +229,7 @@ function render(next) {
   if(microphone&&(!state.online||!state.audio.microphoneWanted||state.audio.maps[2]!=='browser:capture'))stopMicrophone();
   audioNode?.port.postMessage({kind:'gate',enabled:!!(microphone&&tx&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
   audioNode?.port.postMessage({kind:'listen',enabled:listening&&!tx&&state.online&&state.pttKnown});
-  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;scheduleScopes();updateDiagnostics();
+  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;scheduleScopes();updateDiagnostics();resumeMicrophoneWhenReady();
 }
 function renderSettings() {
   const query=$('settingFilter').value.toLowerCase(),alive=new Set();let count=0;
@@ -250,11 +253,14 @@ function renderAudio() {
   $('listen').classList.toggle('selected',listening);setText($('listen'),listening?'Stop listening':'Listen in this browser');$('listen').disabled=listeningBusy;$('microphone').classList.toggle('selected',microphone);setText($('microphone'),microphone?'Disarm browser microphone':!browserMicAvailable()?'Browser microphone unavailable':microphoneBusy?'Waiting for microphone…':'Arm browser microphone');$('microphone').disabled=microphoneBusy||!browserMicAvailable();
   $('playbackMicWorkaround').disabled=!navigator.audioSession||microphone||microphoneBusy;
   $('stableAudio').disabled=!navigator.audioSession||$('playbackMicWorkaround').checked;
+  renderMicrophoneMeter();
 }
 function connectionLost(connection,reason){
   if(socket!==connection)return;
   socket=null;lastDisconnect=reason;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);
-  tuningQueue?.clear();stopClientAudio();
+  if(document.hidden)rememberMicrophoneReturn();
+  if(microphoneReturn){microphoneReturn.probe='';microphoneReturn.ready=false;}
+  tuningQueue?.clear();stopClientAudio(!!microphoneReturn);
   for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Station connection lost'));}
   pending.clear();edits.clear();client=0;
   $('ptt').disabled=$('powerOn').disabled=$('powerOff').disabled=true;$('app').inert=true;
@@ -276,7 +282,7 @@ function reconnect() {
     try{
       const reply=await fetch('/api/ping',{signal:controller.signal,cache:'no-store'});
       if(closing||revision!==connectionRevision||(socket&&socket.readyState<2))return;
-      if(reply.status===401){$('login').hidden=false;$('app').hidden=true;$('mobilePttBar').hidden=true;return;}
+      if(reply.status===401){microphoneReturn=null;$('login').hidden=false;$('app').hidden=true;$('mobilePttBar').hidden=true;return;}
       if(!reply.ok)throw new Error('Station unavailable');
       connectWeb();
     }catch{if(!closing&&revision===connectionRevision){reconnectDelay=Math.min(10000,reconnectDelay*1.5);reconnect();}}
@@ -310,10 +316,15 @@ async function connectWeb() {
     if(typeof event.data!=='string'){binary(event.data);return;}
     let data;
     try{data=JSON.parse(event.data);}catch{retireConnection(connection,'Invalid station reply');return;}
-    if(data.type==='heartbeat'){lastReply=performance.now();delayedTick=false;return;}
+    if(data.type==='heartbeat'){
+      lastReply=performance.now();delayedTick=false;
+      if(microphoneReturn?.visible&&microphoneReturn.probe&&data.resumeMic===microphoneReturn.probe){microphoneReturn.ready=true;microphoneReturn.afterState=stateRevision;}
+      return;
+    }
     if(data.type==='controlIdle'){
       if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});
-      stopMicrophone();setText($('browserStatus'),'Browser microphone disarmed after a control pause. Arm it again to transmit.');return;
+      if(document.hidden)rememberMicrophoneReturn();
+      stopMicrophone(!!microphoneReturn);setText($('browserStatus'),microphoneReturn?'Microphone paused; waiting to restore it when the page returns.':'Browser microphone disarmed after a control pause. Arm it again to transmit.');return;
     }
     if(data.type==='delta'){if(!receivedState)return;render(mergeState(state,data));return;}
     if(data.type==='hello'){client=data.client;return;}
@@ -349,12 +360,54 @@ function audioSessionType(capturing=microphone, preparing=false, listeningNow=li
   }
 }
 function audioInterrupted(message, checkPlayback=false) {
-  if(checkPlayback&&playbackMicActive){
+  if(document.hidden)rememberMicrophoneReturn();
+  const returning=!!microphoneReturn;
+  if(checkPlayback&&playbackMicActive&&!returning){
     disablePlaybackMicWorkaround();
     message+=' Playback-volume workaround switched off. Arm the microphone again.';
   }
   if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});
-  stopMicrophone();setText($('browserStatus'),message);$('resumeAudio').hidden=false;updateDiagnostics();
+  stopMicrophone(returning);setText($('browserStatus'),returning?'Microphone paused; it will try to resume when you return.':message);$('resumeAudio').hidden=false;updateDiagnostics();
+}
+function rememberMicrophoneReturn(){
+  if(closing)return;
+  if(!$('resumeMicOnReturn')?.checked){microphoneReturn=null;return;}
+  if(microphone&&state?.online&&!state.demo){
+    microphoneReturn={generation:state.generation,output:state.audio.maps[3],input:$('browserInput').value,visible:false,ready:false,probe:'',afterState:stateRevision,audioRequested:false};
+  }
+}
+function microphonePageReturned(){
+  if(!microphoneReturn||document.hidden||closing)return;
+  microphoneReturn.visible=true;microphoneReturn.ready=false;microphoneReturn.probe='';microphoneReturn.audioRequested=false;
+  setText($('browserStatus'),'Checking the connection before restoring the microphone…');resumeMicrophoneWhenReady();
+}
+function resumeMicrophoneWhenReady(){
+  const request=microphoneReturn;
+  if(!request||!request.visible||document.hidden||closing||!state||socket?.readyState!==1||!client)return;
+  if(!$('resumeMicOnReturn')?.checked||state.generation!==request.generation||!state.online||state.demo||state.audio.maps[2]!=='browser:capture'||state.audio.maps[3]!==request.output||$('browserInput').value!==request.input){
+    microphoneReturn=null;setText($('browserStatus'),'Radio or audio mapping changed. Arm the microphone manually.');return;
+  }
+  if(!request.probe){
+    request.probe=String(++microphoneReturnProbe);
+    try{socket.send('action=heartbeat&resumeMic='+request.probe);}catch{request.probe='';}
+    return;
+  }
+  if(!request.ready||stateRevision<=request.afterState||microphoneBusy)return;
+  if(state.busy||!state.pttKnown||state.transmitting||state.dashboardPtt||state.pttPending||state.releasePending)return;
+  if(microphone){microphoneReturn=null;return;}
+  if(!audioContext||audioContext.state!=='running'){
+    $('resumeAudio').hidden=false;setText($('resumeAudio'),'Resume audio & mic');
+    setText($('browserStatus'),'Restoring microphone audio. If Safari pauses it, tap Resume audio & mic.');
+    if(audioContext&&!request.audioRequested&&audioContext.state!=='closed'){
+      request.audioRequested=true;
+      audioContext.resume().then(()=>{if(microphoneReturn===request)resumeMicrophoneWhenReady();}).catch(()=>{});
+    }
+    return;
+  }
+  microphoneReturn=null;
+  armMicrophone({automatic:true,generation:request.generation,output:request.output,input:request.input}).then(()=>{
+    if(microphone){$('resumeAudio').hidden=true;setText($('resumeAudio'),'Resume audio');setText($('browserStatus'),'Microphone restored. PTT is off; tap PTT when ready.');}
+  }).catch(error=>{setText($('resumeAudio'),'Resume audio');setText($('browserStatus'),'Microphone could not resume automatically. Tap Arm browser microphone.');notify(error.message||String(error));});
 }
 function browserPlaybackGain(volume,boostDb){
   const level=Number(volume),boost=Number(boostDb);
@@ -372,28 +425,65 @@ function browserPlaybackCurve(){
 function applyBrowserPlaybackLevel(){
   if(listeningGain)listeningGain.gain.value=browserPlaybackGain($('browserVolume').value,$('browserBoostDb').value);
 }
+function applyBrowserMicrophoneLevel(){
+  const gain=browserPlaybackGain(100,$('browserMicBoostDb').value);
+  audioNode?.port.postMessage({kind:'micGain',value:gain});
+}
+function microphoneMeterReading(value){
+  const number=Number(value),peak=Number.isFinite(number)?Math.max(0,Math.min(1,number)):0;
+  const db=peak>0?20*Math.log10(peak):-Infinity;
+  return {db,level:Math.max(0,Math.min(1,(db+72)/72)),text:Number.isFinite(db)?db.toFixed(1)+' dBFS':'Silent'};
+}
+function renderMicrophoneMeter(){
+  const meter=$('clientMicPeak');if(!meter)return;
+  const capturing=!!micSource&&!!micStream;
+  const fresh=micMeter.seen!==null&&performance.now()-micMeter.seen<1500;
+  meter.value=0;
+  if(!capturing){setText($('clientMicLevel'),microphoneBusy?'Opening microphone…':'Mic off');setText($('clientMicHint'),'Arm the browser microphone and speak. PTT is not required for this local input meter.');return;}
+  if(!fresh||!micMeter.present){setText($('clientMicLevel'),'Waiting for mic samples');setText($('clientMicHint'),audioContext?.state==='running'?'No input samples detected. Check microphone permission and the selected browser microphone.':'Audio is paused. Use Resume audio or arm the microphone again.');return;}
+  const boosted=microphoneMeterReading(micMeter.peak),input=microphoneMeterReading(micMeter.input);
+  meter.value=boosted.level;
+  setText($('clientMicLevel'),'Boosted: '+boosted.text);
+  setText($('clientMicHint'),'Phone input: '+input.text+' · '+(micMeter.limited?'Peak protection active — reduce mic gain.':'Input is live · PTT not required.'));
+}
+function microphoneMeterMessage(data){
+  if(!micSource||!micStream)return;
+  micMeter={peak:Number(data.value)||0,input:Number(data.inputPeak??data.value)||0,present:data.inputPresent!==false,limited:!!data.limited,seen:performance.now()};
+  renderMicrophoneMeter();
+}
 async function ensureAudio() {
   if(!window.AudioContext)throw new Error('This browser does not support Web Audio playback');
-  if(!audioContext){audioContext=new AudioContext({latencyHint:'interactive',sampleRate:48000});const context=audioContext;const resumed=context.resume();audioSetup=(async()=>{await resumed;if(isSecureContext&&window.AudioWorkletNode&&context.audioWorklet){await context.audioWorklet.addModule('/audio-worklet.js');audioNode=new AudioWorkletNode(context,'station-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});audioNode.supportsMicrophone=true;}else audioNode=new StationPlayback(context);listeningGain=context.createGain();applyBrowserPlaybackLevel();const peakGuard=context.createWaveShaper();peakGuard.curve=browserPlaybackCurve();audioNode.connect(listeningGain).connect(peakGuard).connect(context.destination);if(isSecureContext&&context.setSinkId&&$('browserOutput').value)await context.setSinkId($('browserOutput').value);audioNode.port.onmessage=({data})=>{if(data.kind==='mic'&&microphone&&socket?.readyState===1&&socket.bufferedAmount<8192)socket.send(data.buffer);if(data.kind==='peak')$('clientMicPeak').value=data.value;};})().catch(async error=>{await context.close().catch(()=>{});if(audioContext===context){audioContext=audioNode=listeningGain=audioSetup=null;}throw error;});}
+  if(audioContext?.state==='closed'){audioContext=audioSetup=audioNode=listeningGain=null;}
+  if(!audioContext){audioContext=new AudioContext({latencyHint:'interactive',sampleRate:48000});const context=audioContext;const resumed=context.resume();audioSetup=(async()=>{await resumed;if(isSecureContext&&window.AudioWorkletNode&&context.audioWorklet){await context.audioWorklet.addModule('/audio-worklet.js');audioNode=new AudioWorkletNode(context,'station-audio',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[2]});audioNode.supportsMicrophone=true;}else audioNode=new StationPlayback(context);listeningGain=context.createGain();applyBrowserPlaybackLevel();const peakGuard=context.createWaveShaper();peakGuard.curve=browserPlaybackCurve();audioNode.connect(listeningGain).connect(peakGuard).connect(context.destination);if(isSecureContext&&context.setSinkId&&$('browserOutput').value)await context.setSinkId($('browserOutput').value);audioNode.port.onmessage=({data})=>{if(data.kind==='mic'&&microphone&&socket?.readyState===1&&socket.bufferedAmount<8192)socket.send(data.buffer);if(data.kind==='peak')microphoneMeterMessage(data);};})().catch(async error=>{await context.close().catch(()=>{});if(audioContext===context){audioContext=audioNode=listeningGain=audioSetup=null;}throw error;});}
   await audioSetup;
-  audioContext.onstatechange=()=>{updateDiagnostics();if(['interrupted','suspended','closed'].includes(audioContext.state)&&(microphone||microphoneBusy))audioInterrupted('Audio interrupted. Tap Resume audio, then arm the microphone again.',true);};
+  audioContext.onstatechange=()=>{updateDiagnostics();if(['interrupted','suspended','closed'].includes(audioContext.state)&&(microphone||microphoneBusy))audioInterrupted('Audio interrupted. Tap Resume audio, then arm the microphone again.',true);if(audioContext.state==='running')resumeMicrophoneWhenReady();};
   await audioContext.resume();
 }
-async function ensureReceive() {
+function requireAudioRequest(epoch,owner){
+  if(epoch!==audioEpoch||owner!==client||closing||socket?.readyState!==1||!state?.online)throw new Error('Connection changed; enable browser audio again');
+}
+async function ensureReceive(epoch=audioEpoch,owner=client) {
+  requireAudioRequest(epoch,owner);
   if(!state.online||state.demo)throw new Error('Connect the physical radio before enabling audio');
   if(!state.audio.maps[0])throw new Error('Choose the radio USB recording device first');
   if(!state.audio.maps[1])await command('audioMap',{slot:'1',device:'browser:playback'});
+  requireAudioRequest(epoch,owner);
   if(!state.audio.receiveWanted)await command('audioRoute',{route:'receive',enabled:'1'});
+  requireAudioRequest(epoch,owner);
 }
 async function listen() {
-  if(listeningBusy)return;listeningBusy=true;const epoch=audioEpoch;renderAudio();
+  if(listeningBusy)return;listeningBusy=true;const epoch=audioEpoch,owner=client;renderAudio();
   try{if(listening){listening=false;audioSessionType();audioNode?.port.postMessage({kind:'listen',enabled:false});await command('listen',{enabled:'0'});setText($('browserStatus'),'Listening stopped.');}
-  else{audioSessionType(microphone,false,true);await ensureAudio();await ensureReceive();await command('listen',{enabled:'1'});if(epoch!==audioEpoch||socket?.readyState!==1)throw new Error('Connection changed; enable listening again');listening=true;expectedAudio=undefined;audioSessionType();audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
+  else{audioSessionType(microphone,false,true);await ensureAudio();requireAudioRequest(epoch,owner);await ensureReceive(epoch,owner);requireAudioRequest(epoch,owner);await command('listen',{enabled:'1'});requireAudioRequest(epoch,owner);listening=true;expectedAudio=undefined;audioSessionType();audioNode.port.postMessage({kind:'listen',enabled:!state.transmitting});setText($('browserStatus'),'Listening to radio receive audio in this browser.');}}
   finally{listeningBusy=false;renderAudio();}
 }
-function stopMicrophone() { ++audioEpoch;microphone=false;playbackMicActive=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;const stream=micStream;micStream=null;stream?.getTracks().forEach(track=>track.stop());if(micRegistered){micRegistered=false;command('browserMic',{enabled:'0'}).catch(()=>{});}audioSessionType();$('clientMicPeak').value=0;if(state)renderAudio(); }
-function stopClientAudio() { listening=false;stopMicrophone();audioNode?.port.postMessage({kind:'listen',enabled:false});audioNode?.port.postMessage({kind:'reset'});expectedAudio=undefined;setText($('browserStatus'),'Browser audio stopped.');if(state)renderAudio(); }
-async function armMicrophone() {
+function stopMicrophone(keepReturn=false) { if(!keepReturn)microphoneReturn=null;++audioEpoch;microphone=false;playbackMicActive=false;audioNode?.port.postMessage({kind:'gate',enabled:false,lease:0});micSource?.disconnect();micSource=null;const stream=micStream;micStream=null;stream?.getTracks().forEach(track=>track.stop());if(micRegistered){micRegistered=false;command('browserMic',{enabled:'0'}).catch(()=>{});}audioSessionType();micMeter={peak:0,input:0,present:false,limited:false,seen:null};renderMicrophoneMeter();if(state)renderAudio(); }
+function stopClientAudio(keepReturn=false) { listening=false;stopMicrophone(keepReturn);audioNode?.port.postMessage({kind:'listen',enabled:false});audioNode?.port.postMessage({kind:'reset'});expectedAudio=undefined;setText($('browserStatus'),'Browser audio stopped.');if(state)renderAudio(); }
+async function armMicrophone(options={}) {
+  const automatic=options?.automatic===true;
+  if(!automatic)microphoneReturn=null;
+  const mayRestore=()=>!automatic||(!document.hidden&&!closing&&$('resumeMicOnReturn')?.checked&&state?.generation===options.generation&&state.audio.maps[2]==='browser:capture'&&state.audio.maps[3]===options.output&&$('browserInput').value===options.input&&state.pttKnown&&!state.transmitting&&!state.dashboardPtt&&!state.pttPending&&!state.releasePending);
+  if(!mayRestore())throw new Error('Wait for confirmed RX before restoring the microphone');
   if(microphone){if(state.browserOwner===client)await command('ptt',{enabled:'0'});stopMicrophone();setText($('browserStatus'),'Browser microphone disarmed.');return;}
   if(!browserMicAvailable())throw new Error('Microphone capture needs a supported browser and trusted HTTPS. Install and trust the station certificate, then open this page in Safari or another current browser.');
   if(!state.online||state.demo||!state.audio.maps[3])throw new Error('Connect the radio and choose its USB transmit playback device first');
@@ -402,28 +492,35 @@ async function armMicrophone() {
     // Request a capture-compatible session before permission/device access.
     // The optional playback override is applied only after capture is live.
     audioSessionType(true,true);await ensureAudio();
+    if(epoch!==audioEpoch||owner!==client||!mayRestore())throw new Error('Audio interrupted while restoring the microphone');
     const device=$('browserInput').value;
     const stream=await navigator.mediaDevices.getUserMedia({audio:{...(device?{deviceId:{exact:device}}:{}),channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online||!mayRestore()){stream.getTracks().forEach(track=>track.stop());throw new Error('Connection changed; arm the microphone again');}
     micStream=stream;
-    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');
-    await command('audioMap',{slot:'2',device:'browser:capture'});await command('browserMic',{enabled:'1'});micRegistered=true;
-    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online)throw new Error('Connection changed; arm the microphone again');
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online||!mayRestore())throw new Error('Connection changed; arm the microphone again');
+    await command('audioMap',{slot:'2',device:'browser:capture'});
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online||!mayRestore())throw new Error('Connection changed; arm the microphone again');
+    await command('browserMic',{enabled:'1'});micRegistered=true;
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online||!mayRestore())throw new Error('Connection changed; arm the microphone again');
     for(const track of stream.getAudioTracks()){
       track.addEventListener('ended',()=>{if(micStream===stream)audioInterrupted('Microphone disconnected. Choose a device and arm it again.',true);},{once:true});
       track.addEventListener('mute',()=>{if(micStream===stream)audioInterrupted('Microphone interrupted. Tap Resume audio and arm it again.',true);},{once:true});
     }
-    await audioContext.resume();micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;
+    await audioContext.resume();
+    if(epoch!==audioEpoch||owner!==client||socket?.readyState!==1||!state.online||!mayRestore())throw new Error('Connection changed; arm the microphone again');
+    applyBrowserMicrophoneLevel();
+    micSource=audioContext.createMediaStreamSource(stream);micSource.connect(audioNode);microphone=true;
     audioSessionType();
-    if(!microphone||stream.getAudioTracks().some(track=>track.readyState==='ended'||track.muted)){
+    if(!microphone||!mayRestore()||stream.getAudioTracks().some(track=>track.readyState==='ended'||track.muted)){
       if(playbackMicActive)disablePlaybackMicWorkaround();
       throw new Error('Microphone did not remain active. Arm it again with the playback-volume workaround off.');
     }
-    audioNode.port.postMessage({kind:'gate',enabled:!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
+    audioNode.port.postMessage({kind:'gate',enabled:!automatic&&!!(state.transmitting&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
     setText($('browserStatus'),playbackMicActive?'Microphone armed with playback-volume workaround. Check the mic meter before using PTT.':'Microphone armed. Tap PTT on to transmit, then PTT off.');
     browserDevices().catch(error=>notify(error.message));
   }
-  catch(error){stopMicrophone();throw error;}
-  finally{microphoneBusy=false;renderAudio();}
+  catch(error){stopMicrophone(!!microphoneReturn&&epoch!==audioEpoch);throw error;}
+  finally{microphoneBusy=false;renderAudio();resumeMicrophoneWhenReady();}
 }
 async function browserDevices() {
   if(!navigator.mediaDevices?.enumerateDevices)throw new Error('Browser device selection is unavailable. Check HTTPS certificate trust and browser permissions; use the phone or OS controls for its speaker or headset.');const devices=await navigator.mediaDevices.enumerateDevices();
@@ -513,11 +610,11 @@ function tuneRfFromCanvas(event,id){
 }
 function installPageLifecycle(){
   window.addEventListener('resize',scheduleScopes);
-  window.addEventListener('pagehide',()=>{closing=true;++connectionRevision;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio();socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
-  window.addEventListener('pageshow',event=>{if(event.persisted){closing=false;connectWeb();setText($('browserStatus'),'Page restored. Enable listening and arm the microphone again.');}});
+  window.addEventListener('pagehide',()=>{rememberMicrophoneReturn();if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});closing=true;++connectionRevision;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);clearTimeout(reconnectTimer);tuningQueue?.clear();stopClientAudio(!!microphoneReturn);socket?.close();for(const item of pending.values()){clearTimeout(item.timer);item.reject(new Error('Page closed'));}pending.clear();edits.clear();});
+  window.addEventListener('pageshow',event=>{if(event.persisted){closing=false;connectWeb();setText($('browserStatus'),'Page restored. Enable listening and arm the microphone again.');microphonePageReturned();}});
   const wake=()=>{if(!closing&&(!socket||socket.readyState>1)){reconnectDelay=250;reconnect();}};
   window.addEventListener('online',wake);
-  document.addEventListener?.('visibilitychange',()=>{if(!document.hidden)wake();});
+  document.addEventListener?.('visibilitychange',()=>{if(!document.hidden){wake();microphonePageReturned();}});
 }
 async function exportCsv(){if(!state)return;const cell=value=>'"'+String(value??'').replace(/"/g,'""')+'"',utc=new Date().toISOString();const rows=[['Name','Group','Hamlib ID','Value','Raw value','Access','Range','Status','VFO','UTC']];state.vfos.forEach((vfo,index)=>{const name=index?'B':'A';for(const [field,label,valid,reading]of [['frequency','frequency (Hz)',vfo.frequencyValid,String(vfo.frequency)],['mode','mode / width',vfo.modeValid,vfo.mode+' / '+vfo.width]])rows.push(['VFO '+name+' '+label,'Radio / VFO','VFO'+name+'.'+field,valid?reading:'',valid?reading:'','Read / write','',valid?'Live':'Unavailable',name,utc]);});for(const item of state.settings)rows.push([item.name,item.group,item.id,item.valid?item.display:'',item.valid?item.value:'',item.writable?'Read / write':'Read only',item.range,item.status,state.settingsVfo,utc]);const blob=new Blob(['\ufeff'+rows.map(row=>row.map(cell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=element('a');link.href=url;link.download='FT710-settings.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 function setup(){
@@ -535,7 +632,7 @@ function setup(){
   document.querySelectorAll('[data-page]').forEach(node=>node.addEventListener('click',()=>showPage(node.dataset.page)));
   document.querySelectorAll('[data-action]').forEach(node=>node.addEventListener('click',protect(()=>command(node.dataset.action))));
   document.querySelectorAll('[data-vfo]').forEach(node=>node.addEventListener('click',protect(()=>{$('controlVfo').value=node.dataset.vfo;dirty.delete('frequency');dirty.delete('width');return command('vfo',{vfo:node.dataset.vfo},'controlVfo');})));
-  $('loginForm').addEventListener('submit',protect(async event=>{event.preventDefault();const reply=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code:$('accessCode').value})});const data=await reply.json();if(!reply.ok){$('loginError').textContent=data.error;return;}$('accessCode').value='';closing=false;connectWeb();}));
+  $('loginForm').addEventListener('submit',protect(async event=>{event.preventDefault();const reply=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code:$('accessCode').value})});const data=await reply.json();if(!reply.ok){$('loginError').textContent=data.error;return;}$('accessCode').value='';microphoneReturn=null;closing=false;connectWeb();}));
   $('connectionForm').addEventListener('submit',protect(event=>{event.preventDefault();clearTimeout(preferenceSaveTimer);if(state.portOpen)return command('disconnect');const fields={kind:$('connectionKind').value};for(const key of ['endpoint','baud','stopBits','flow','poll'])fields[key]=$(key).value;for(const key of ['connectionKind','endpoint','baud','stopBits','flow','poll'])dirty.delete(key);return command('connect',fields);}));
   $('connectionKind').addEventListener('change',()=>{const before=$('endpoint').value;if($('connectionKind').value==='1'&&!before.includes(':'))$('endpoint').value='127.0.0.1:4532';if($('connectionKind').value==='0'&&before.includes(':'))$('endpoint').value='COM3';if(before!==$('endpoint').value){dirty.add('endpoint');preferenceSaver.edit('endpoint');}});
   $('saveSharing').addEventListener('click',protect(async()=>{await command('sharing',{enabled:$('shareEnabled').checked?'1':'0',port:$('sharePort').value});dirty.delete('shareEnabled');dirty.delete('sharePort');}));
@@ -565,8 +662,10 @@ function setup(){
   for(const id of ['browserInput','browserOutput']){const saved=localStorage.getItem(id);if(saved){const option=element('option','Saved device / refresh devices');option.value=saved;$(id).append(option);$(id).value=saved;}}
   const savedBoost=localStorage.getItem('browserBoostDb');if([...$('browserBoostDb').options].some(option=>option.value===savedBoost))$('browserBoostDb').value=savedBoost;
   $('browserBoostDb').addEventListener('change',()=>{localStorage.setItem('browserBoostDb',$('browserBoostDb').value);applyBrowserPlaybackLevel();});
+  const savedMicBoost=localStorage.getItem('browserMicBoostDb');if([...$('browserMicBoostDb').options].some(option=>option.value===savedMicBoost))$('browserMicBoostDb').value=savedMicBoost;
+  $('browserMicBoostDb').addEventListener('change',()=>{localStorage.setItem('browserMicBoostDb',$('browserMicBoostDb').value);applyBrowserMicrophoneLevel();});
   const savedVolume=localStorage.getItem('browserVolume');if(savedVolume!==null&&Number.isFinite(Number(savedVolume)))$('browserVolume').value=Math.max(0,Math.min(100,Number(savedVolume)));
-  $('browserInput').addEventListener('change',()=>{localStorage.setItem('browserInput',$('browserInput').value);if(microphone||microphoneBusy){stopMicrophone();notify('Microphone selection changed. Arm the browser microphone again.',false);if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});}});
+  $('browserInput').addEventListener('change',()=>{microphoneReturn=null;localStorage.setItem('browserInput',$('browserInput').value);if(microphone||microphoneBusy){stopMicrophone();notify('Microphone selection changed. Arm the browser microphone again.',false);if(state?.browserOwner===client)command('ptt',{enabled:'0'}).catch(()=>{});}});
   $('browserOutput').addEventListener('change',protect(async()=>{await ensureAudio();if(!audioContext.setSinkId)throw new Error('This browser uses the system output');await audioContext.setSinkId($('browserOutput').value);localStorage.setItem('browserOutput',$('browserOutput').value);}));$('browserVolume').addEventListener('input',()=>{localStorage.setItem('browserVolume',$('browserVolume').value);applyBrowserPlaybackLevel();});
   for(const id of ['scopeSpan','scopeGain','scopeFloor']){const saved=localStorage.getItem(id);if([...$(id).options].some(option=>option.value===saved))$(id).value=saved;$(id).addEventListener('change',()=>{localStorage.setItem(id,$(id).value);drawScope();});}
   // Station preferences come from the server; localStorage holds local display/audio choices only.
@@ -585,7 +684,9 @@ function setup(){
   $('playbackMicWorkaround').disabled=!navigator.audioSession;
   $('stableAudio').disabled=!navigator.audioSession||$('playbackMicWorkaround').checked;
   $('playbackMicWorkaround').addEventListener('change',()=>{localStorage.setItem('playbackMicWorkaround',$('playbackMicWorkaround').checked?'1':'0');audioSessionType();if(state)renderAudio();});
-  $('resumeAudio').addEventListener('click',protect(async()=>{await ensureAudio();$('resumeAudio').hidden=true;setText($('browserStatus'),'Audio resumed. Arm the microphone again to transmit.');}));
+  $('resumeMicOnReturn').checked=localStorage.getItem('resumeMicOnReturn')==='1';
+  $('resumeMicOnReturn').addEventListener('change',()=>{localStorage.setItem('resumeMicOnReturn',$('resumeMicOnReturn').checked?'1':'0');if(!$('resumeMicOnReturn').checked)microphoneReturn=null;});
+  $('resumeAudio').addEventListener('click',protect(async()=>{await ensureAudio();$('resumeAudio').hidden=true;setText($('resumeAudio'),'Resume audio');if(microphoneReturn)resumeMicrophoneWhenReady();else setText($('browserStatus'),microphone?'Microphone is ready. Tap PTT when needed.':'Audio resumed. Arm the microphone again to transmit.');}));
   $('unattended').addEventListener('change',protect(()=>command('unattended',{enabled:$('unattended').checked?'1':'0'})));
   navigator.mediaDevices?.addEventListener?.('devicechange',()=>{browserDevices().catch(()=>{});updateDiagnostics();});
   navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.',true);});
