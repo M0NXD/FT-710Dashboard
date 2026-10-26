@@ -132,6 +132,7 @@ private:
     bool catRecentlyActive();
     void invalidateReadbacks(); // Radio worker only; called before every write.
     int prepareModeWrite();
+    int readPtt(vfo_t vfo, ptt_t* ptt);
     int confirmFrequency(int result, vfo_t vfo, freq_t requested, bool split = false);
     int confirmMode(int result, vfo_t vfo, rmode_t requested, bool split = false);
     vfo_t readbackVfo(vfo_t vfo) const;

@@ -229,7 +229,7 @@ CatReply Worker::executeCat(const CatRequest& request) {
     } else if (name == "set_vfo") {
         need(1); reply.result = rig_set_vfo(rig_, vfoValue(args[0]));
     } else if (name == "get_ptt") {
-        need(0); ptt_t status{}; reply.result = rig_get_ptt(rig_, vfo, &status); add("PTT", std::to_string(status));
+        need(0); ptt_t status{}; reply.result = readPtt(vfo, &status); add("PTT", std::to_string(status));
     } else if (name == "set_ptt") {
         need(1); int status = integer(args[0]); if (status < 0 || status > 3) return fail(-RIG_EINVAL);
         if (status != 0 && (state_.releasePending || heldPtt_ || (catPttOwner_ && catPttOwner_ != request.client))) return fail(-RIG_ERJCTED);

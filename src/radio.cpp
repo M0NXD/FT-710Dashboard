@@ -11,6 +11,15 @@
 namespace radio {
 using Clock = std::chrono::steady_clock;
 namespace {
+class FreshRead {
+    RIG* rig_;
+    int timeout_;
+public:
+    explicit FreshRead(RIG* rig) : rig_(rig), timeout_(rig_get_cache_timeout_ms(rig, HAMLIB_CACHE_ALL)) {
+        rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    }
+    ~FreshRead() { rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, timeout_); }
+};
 bool recentReadback(Clock::time_point time) {
     return time != Clock::time_point{} && Clock::now() - time < std::chrono::milliseconds(250);
 }
@@ -349,6 +358,12 @@ void Worker::run() {
                 nextPoll = Clock::now() + std::chrono::milliseconds(connection_.pollMs);
                 nextMeters = Clock::now() + std::chrono::milliseconds(250);
             }
+            // A continuous stream of NET reads must not starve meters behind
+            // an interrupted full scan. Writes/releases still take precedence.
+            if (Clock::now() >= nextMeters && rig_ && state_.online && !state_.poweredOff && !urgentCommandPending()) {
+                pollMeters();
+                nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 100 : 250);
+            }
             if (Clock::now() < catQuietUntil) continue;
             catBurst = false;
             if (Clock::now() >= nextPoll) {
@@ -356,11 +371,8 @@ void Worker::run() {
                 // Resume interrupted scans after servicing the queued command.
                 // Restarting at frequency A starves later controls under CAT traffic.
                 nextPoll = complete ? Clock::now() + std::chrono::milliseconds(state_.online ? connection_.pollMs : 2000) : Clock::now();
-                if (complete) nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 250 : 500);
-            } else if (Clock::now() >= nextMeters) {
-                if (rig_ && state_.online && !state_.poweredOff) pollMeters();
-                nextMeters = Clock::now() + std::chrono::milliseconds(state_.transmitting ? 250 : 500);
             }
+            if (Clock::now() >= nextMeters) nextMeters = Clock::now() + std::chrono::milliseconds(100);
         } catch (const std::exception& e) {
             state_.busy = false;
             state_.error = e.what();
@@ -419,11 +431,11 @@ void Worker::connect(const Connection& connection) {
         config("retry", "0");
     }
     if (connection.type == ConnectionType::Serial) {
-        // The dashboard owns readback caching. Hamlib must not confirm a write
-        // using its optimistic set cache, or skip it after detecting knob motion.
+        // Keep routine reads bounded, with uncached confirmation only around
+        // writes. Disabling every Hamlib cache multiplies serial traffic.
         config("twiddle_timeout", "0");
         config("freq_skip", "0");
-        config("cache_timeout", "0");
+        config("cache_timeout", "250");
         config("serial_speed", std::to_string(connection.baud));
         config("stop_bits", std::to_string(connection.stopBits));
         config("serial_handshake", connection.handshake);
@@ -443,7 +455,7 @@ void Worker::connect(const Connection& connection) {
     state_.portOpen = true;
     if (connection.type == ConnectionType::Serial) {
         // rig_open/backend setup may change the generic cache timeout again.
-        rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+        rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 250);
         // The 4.7.2 FT-710 descriptor inherited 200 W / 75 W ranges from
         // another Yaesu. Correct this instance's advertised power ranges.
         auto& ranges = HAMLIB_STATE(rig_)->tx_range_list;
@@ -733,14 +745,12 @@ int Worker::rfPowerMaximum() {
     return 100;
 }
 void Worker::pollMeters(bool publishUpdate) {
-    auto commandPending = [&] {
-        std::lock_guard lock(mutex_);
-        return stopping_ || !commands_.empty();
-    };
+    auto commandPending = [&] { return urgentCommandPending(); };
     if (commandPending()) return;
     ptt_t ptt{};
-    state_.pttKnown = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt) == RIG_OK;
+    state_.pttKnown = readPtt(RIG_VFO_CURR, &ptt) == RIG_OK;
     state_.transmitting = state_.pttKnown && ptt != RIG_PTT_OFF;
+    if (state_.pttKnown) state_.lastContact = Clock::now();
     if (state_.pttKnown && !state_.transmitting) { heldPtt_ = false; catPttOwner_ = 0; state_.releasePending = false; }
     // Clear TX readings immediately on RX/unknown PTT, even if a queued
     // client request interrupts the remainder of this batch.
@@ -755,6 +765,7 @@ void Worker::pollMeters(bool publishUpdate) {
     const std::array<setting_t, 9> levels{RIG_LEVEL_RFPOWER_METER_WATTS, RIG_LEVEL_ALC, RIG_LEVEL_SWR,
             RIG_LEVEL_COMP_METER, RIG_LEVEL_ID_METER, RIG_LEVEL_VD_METER,
             RIG_LEVEL_RFPOWER, RIG_LEVEL_STRENGTH, RIG_LEVEL_RAWSTR};
+    unsigned reads = 0;
     for (std::size_t count = 0; count < levels.size(); ++count) {
         auto mask = levels[meterIndex_++ % levels.size()];
         auto it = std::find_if(state_.settings.begin(), state_.settings.end(), [&](const Setting& s) { return s.kind == Kind::Level && s.mask == mask; });
@@ -764,6 +775,7 @@ void Worker::pollMeters(bool publishUpdate) {
             if ((it->txOnly && !state_.transmitting) ||
                 (state_.transmitting && (mask == RIG_LEVEL_STRENGTH || mask == RIG_LEVEL_RAWSTR))) continue;
             read(*it);
+            ++reads;
             // Derive the relative output from the same calibrated RM5 read.
             if (it->mask == RIG_LEVEL_RFPOWER_METER_WATTS) for (auto& relative : state_.settings)
                 if (relative.kind == Kind::Level && relative.mask == RIG_LEVEL_RFPOWER_METER) {
@@ -771,7 +783,7 @@ void Worker::pollMeters(bool publishUpdate) {
                     if (it->valid) relative.value = formatNumber(std::clamp(numeric(it->value) / 100, 0.0, 1.0));
                 }
         }
-        if (commandPending()) break;
+        if (reads >= 2 || commandPending()) break;
     }
     if (publishUpdate) publish();
 }
@@ -792,13 +804,16 @@ bool Worker::catRecentlyActive() {
 void Worker::invalidateReadbacks() {
     frequencies_.clear(); modes_.clear(); splits_.clear(); activeVfoReadback_ = {};
 }
+int Worker::readPtt(vfo_t vfo, ptt_t* ptt) {
+    FreshRead fresh(rig_);
+    return rig_get_ptt(rig_, vfo, ptt);
+}
 int Worker::prepareModeWrite() {
     if (rig_->caps->rig_model != RIG_MODEL_FT710) return RIG_OK;
-    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
     // rig_set_mode silently returns success when Hamlib's cached PTT is on.
     // Refresh it even if a front-panel/USB PTT release happened between polls.
     ptt_t ptt{};
-    const int result = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt);
+    const int result = readPtt(RIG_VFO_CURR, &ptt);
     if (result != RIG_OK) return result;
     if (ptt != RIG_PTT_OFF) {
         log_("Mode change rejected: the radio is transmitting; release PTT first.");
@@ -808,7 +823,7 @@ int Worker::prepareModeWrite() {
 }
 int Worker::confirmFrequency(int result, vfo_t vfo, freq_t requested, bool split) {
     if (result != RIG_OK || rig_->caps->rig_model != RIG_MODEL_FT710) return result;
-    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    FreshRead fresh(rig_);
     invalidateReadbacks();
     freq_t actual{};
     result = split ? rig_get_split_freq(rig_, vfo, &actual) : rig_get_freq(rig_, vfo, &actual);
@@ -825,7 +840,7 @@ int Worker::confirmFrequency(int result, vfo_t vfo, freq_t requested, bool split
 }
 int Worker::confirmMode(int result, vfo_t vfo, rmode_t requested, bool split) {
     if (result != RIG_OK || rig_->caps->rig_model != RIG_MODEL_FT710) return result;
-    rig_set_cache_timeout_ms(rig_, HAMLIB_CACHE_ALL, 0);
+    FreshRead fresh(rig_);
     invalidateReadbacks();
     rmode_t actual{}; pbwidth_t width{};
     result = split ? rig_get_split_mode(rig_, vfo, &actual, &width) : rig_get_mode(rig_, vfo, &actual, &width);
@@ -1209,7 +1224,7 @@ void Worker::execute(const Command& command) {
         if (heldPtt_ || catPttOwner_ || state_.releasePending)
             throw std::runtime_error("Release PTT before starting the antenna tuning cycle.");
         ptt_t ptt{};
-        const int status = rig_get_ptt(rig_, RIG_VFO_CURR, &ptt);
+        const int status = readPtt(RIG_VFO_CURR, &ptt);
         if (status != RIG_OK) throw std::runtime_error("Cannot read TX status; antenna tuning was not started.");
         if (ptt != RIG_PTT_OFF) throw std::runtime_error("The radio is transmitting; release PTT before antenna tuning.");
         // FT-710's Hamlib TUNE operation sends AC003;. The radio controls
@@ -1227,7 +1242,7 @@ void Worker::execute(const Command& command) {
         if (catPttOwner_) throw std::runtime_error("PTT is already held by a CAT client.");
         {
             ptt_t current{};
-            int pttRead = rig_get_ptt(rig_, RIG_VFO_CURR, &current);
+            int pttRead = readPtt(RIG_VFO_CURR, &current);
             auto readMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count();
             if (pttRead != RIG_OK) {
                 if (queueMs > 100 || readMs > 100) log_("Dashboard PTT timing: queue " + std::to_string(queueMs) + " ms, status read " + std::to_string(readMs) + " ms.");

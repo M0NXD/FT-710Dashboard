@@ -38,6 +38,7 @@ public:
     std::atomic<bool> transmitting{true};
     std::atomic<bool> ignoreFrequency{false}, ignoreMode{false};
     std::atomic<bool> holdPttRead{false}, pttReadBlocked{false};
+    std::atomic<int> commandDelayMs{0};
     std::atomic<int> power{50}, vfoWrites{0}, meterReads{0}, filterWrites{0};
     std::atomic<int> frequencyA{14200000}, frequencyB{7074000};
     std::atomic<int> activeVfo{0}, split{0};
@@ -141,6 +142,7 @@ private:
             while (true) {
                 auto end = buffer.find(';'); if (end == std::string::npos) break;
                 auto command = buffer.substr(0, end); buffer.erase(0, end + 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(commandDelayMs.load()));
                 auto reply = answer(command); if (!reply.empty() && !sendAll(peer, reply)) break;
             }
         }
@@ -212,7 +214,14 @@ int main() {
         radio::Command connect; connect.action = radio::Action::Connect; connect.connection.type = radio::ConnectionType::Serial;
         connect.connection.endpoint = "127.0.0.1:" + std::to_string(fixture.port); connect.connection.pollMs = 2000;
         worker.submit(connect);
-        wait([](const auto& s) { auto meter = radio::findSetting(s, "level.RFPOWER_METER_WATTS"); return s.online && meter && meter->valid; }, "FT-710 worker did not publish TX meters");
+        wait([](const auto& s) {
+            if (!s.online) return false;
+            for (const auto* id : {"RFPOWER_METER_WATTS", "ALC", "SWR", "COMP_METER", "ID_METER", "VD_METER"}) {
+                const auto* meter = radio::findSetting(s, std::string("level.") + id);
+                if (!meter || !meter->valid) return false;
+            }
+            return true;
+        }, "FT-710 worker did not publish TX meters");
         std::cout << "PASS actual Hamlib FT-710 driver connects to loopback CAT fixture\n";
         auto snapshot = current();
         for (auto [id, expected] : std::vector<std::pair<std::string, double>>{{"RFPOWER_METER_WATTS",50},{"ALC",.5},{"SWR",1.5},{"COMP_METER",10},{"ID_METER",5},{"VD_METER",13.8}}) {
@@ -336,6 +345,39 @@ int main() {
             require(start.get().result != RIG_OK, "Release allowed an older queued CAT PTT-on to execute");
             require(!fixture.transmitting, "Older queued PTT-on keyed after release");
             std::cout << "PASS priority PTT release cancels older queued CAT transmit starts\n";
+            fixture.transmitting = true; fixture.commandDelayMs = 15;
+            wait([](const auto& s) { return s.pttKnown && s.transmitting; }, "TX polling did not resume");
+            const auto trafficEnd = std::chrono::steady_clock::now() + 6s;
+            auto pollingClient = [&](unsigned id) {
+                unsigned replies = 0;
+                while (std::chrono::steady_clock::now() < trafficEnd) {
+                    auto pending = std::make_shared<radio::CatJob>();
+                    pending->request.name = "get_vfo_info"; pending->request.arguments = {"VFOA"};
+                    pending->request.client = id; pending->request.generation = current().generation;
+                    auto result = worker.request(pending);
+                    require(result.wait_for(2s) == std::future_status::ready, "Meter scheduling stalled CAT client");
+                    check(result.get().result, "Concurrent VFO polling"); ++replies;
+                }
+                return replies;
+            };
+            auto trafficA = std::async(std::launch::async, pollingClient, 1001);
+            auto trafficB = std::async(std::launch::async, pollingClient, 1002);
+            bool fresh = true;
+            while (std::chrono::steady_clock::now() < trafficEnd) {
+                if (std::chrono::steady_clock::now() > trafficEnd - 4s) {
+                    const auto live = current();
+                    for (const auto* id : {"RFPOWER_METER_WATTS", "ALC", "SWR", "COMP_METER", "ID_METER", "VD_METER"}) {
+                        const auto* meter = radio::findSetting(live, std::string("level.") + id);
+                        fresh = fresh && live.pttKnown && live.transmitting && meter && meter->valid &&
+                            std::chrono::steady_clock::now() - meter->updated < 2s;
+                    }
+                }
+                std::this_thread::sleep_for(20ms);
+            }
+            require(trafficA.get() > 5 && trafficB.get() > 5, "Two CAT clients did not progress");
+            require(fresh, "TX meters aged out during two-client CAT polling");
+            fixture.commandDelayMs = 0; fixture.transmitting = false;
+            std::cout << "PASS TX meters remain fresh with two continuous CAT readers and realistic serial latency\n";
         }
         server.stop();
         worker.stop();
