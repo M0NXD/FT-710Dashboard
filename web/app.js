@@ -24,6 +24,9 @@ const gainSpecs = [['level.AF','AF gain (%)',100],['level.RF','RF gain (%)',100]
 const cycleSpecs = [['preamp','Preamp: IPO'],['dnr','DNR: Off'],['nb','NB: Off']];
 const functionSpecs = [['func.ANF','Auto notch'],['func.APF','APF'],['func.MON','Monitor'],['func.COMP','Processor'],['func.VOX','VOX'],['func.LOCK','Dial lock'],['func.TUNER','Tuner']];
 const meterElements = [], gainElements = [], cycleElements = [], functionElements = [], settingRows = new Map();
+let phoneMedia,phoneStash,phonePanelName='',phoneReturnFocus;
+const phoneMoves=[],phonePanels=new Map();
+const pagePositions=new Map();
 function element(tag, text, className) { const node = document.createElement(tag); if(text !== undefined) node.textContent=text; if(className) node.className=className; return node; }
 function setText(node, text) { const value=String(text ?? ''); if(node.textContent!==value) node.textContent=value; }
 function value(id, next) { const node=$(id); if(!dirty.has(id) && document.activeElement!==node && !edits.has(id)) node.value=String(next ?? ''); }
@@ -125,7 +128,13 @@ function optionList(node, entries, selected) {
   const signature=JSON.stringify(entries); if(node.dataset.options!==signature) { const previous=node.value;node.replaceChildren(...entries.map(([label,value])=>{const option=element('option',label);option.value=value;return option;}));node.dataset.options=signature;if(document.activeElement===node||dirty.has(node.id))node.value=previous; }
   if(document.activeElement!==node && !dirty.has(node.id)) node.value=String(selected ?? '');
 }
-function showPage(name) { activePage=name;if(name==='settings'&&state)renderSettings();document.querySelectorAll('.page').forEach(node=>node.hidden=node.id!==name);document.querySelectorAll('[data-page]').forEach(node=>node.classList.toggle('selected',node.dataset.page===name));subscribeScopes();scheduleScopes();const tab=document.querySelector(`[data-page="${name}"]`);if(tab&&window.matchMedia('(max-width: 650px)').matches)tab.scrollIntoView({behavior:'smooth',block:'nearest',inline:'center'});window.scrollTo(0,0); }
+function showPage(name) {
+  closePhoneSheet();pagePositions.set(activePage,window.scrollY||0);activePage=name;
+  if(name==='settings'&&state)renderSettings();
+  document.querySelectorAll('.page').forEach(node=>node.hidden=node.id!==name);
+  document.querySelectorAll('[data-page]').forEach(node=>node.classList.toggle('selected',node.dataset.page===name||!!(node.closest('#phoneNav')&&node.dataset.page==='more'&&['rfScope','scope','activity'].includes(name))));
+  subscribeScopes();scheduleScopes();window.scrollTo(0,pagePositions.get(name)||0);
+}
 function updateStickyNavigation(){const header=document.querySelector('.topbar'),notice=$('notice');if(!header||!notice)return;const headerHeight=Math.ceil(header.getBoundingClientRect().height),noticeHeight=notice.getBoundingClientRect().height;document.documentElement.style.setProperty('--topbar-height',headerHeight+'px');document.documentElement.style.setProperty('--section-tabs-top',headerHeight+noticeHeight+'px');}
 function frequency(hz) { return Math.round(hz).toString().padStart(8,'0').replace(/(\d+)(\d{3})(\d{3})$/,'$1.$2.$3'); }
 function parseFrequencyInput(input){let text=String(input).trim().toLowerCase().replace(/\s+/g,'');let multiplier=0;for(const [unit,scale]of [['mhz',1e6],['khz',1e3],['hz',1]])if(text.endsWith(unit)){text=text.slice(0,-unit.length);multiplier=scale;break;}const separators=(text.match(/[.,]/g)||[]).length;if(separators>1)text=text.replace(/[.,]/g,'');else text=text.replace(',','.');const match=text.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))$/);if(!match)throw new Error('Enter a frequency such as 7.074 MHz, 7074 kHz, or 7074000 Hz');const value=Number(match[1]);if(!Number.isFinite(value))throw new Error('Enter a valid radio frequency');if(!multiplier)multiplier=value<=60?1e6:value<=60000?1e3:1;const hz=Math.round(value*multiplier);if(hz<30000||hz>60000000)throw new Error('Frequency must be between 0.030 and 60 MHz');return hz;}
@@ -229,7 +238,7 @@ function render(next) {
   if(microphone&&(!state.online||!state.audio.microphoneWanted||state.audio.maps[2]!=='browser:capture'))stopMicrophone();
   audioNode?.port.postMessage({kind:'gate',enabled:!!(microphone&&tx&&state.dashboardPtt&&state.browserOwner===client),lease:state.micLease||0});
   audioNode?.port.postMessage({kind:'listen',enabled:listening&&!tx&&state.online&&state.pttKnown});
-  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;scheduleScopes();updateDiagnostics();resumeMicrophoneWhenReady();
+  if(!state.scope.fresh&&!scopeFrozen)scopeBins=null;scheduleScopes();updateDiagnostics();renderPhone();resumeMicrophoneWhenReady();
 }
 function renderSettings() {
   const query=$('settingFilter').value.toLowerCase(),alive=new Set();let count=0;
@@ -254,9 +263,11 @@ function renderAudio() {
   $('playbackMicWorkaround').disabled=!navigator.audioSession||microphone||microphoneBusy;
   $('stableAudio').disabled=!navigator.audioSession||$('playbackMicWorkaround').checked;
   renderMicrophoneMeter();
+  renderPhoneAudio();
 }
 function connectionLost(connection,reason){
   if(socket!==connection)return;
+  closePhoneSheet();
   socket=null;lastDisconnect=reason;cancelTunerClick();clearTimeout(connectionTimer);clearInterval(heartbeat);
   if(document.hidden)rememberMicrophoneReturn();
   if(microphoneReturn){microphoneReturn.probe='';microphoneReturn.ready=false;}
@@ -438,6 +449,7 @@ function renderMicrophoneMeter(){
   const meter=$('clientMicPeak');if(!meter)return;
   const capturing=!!micSource&&!!micStream;
   const fresh=micMeter.seen!==null&&performance.now()-micMeter.seen<1500;
+  if(phoneMedia?.matches&&$('phoneMicPeak'))$('phoneMicPeak').value=capturing&&fresh&&micMeter.present?microphoneMeterReading(micMeter.peak).level:0;
   meter.value=0;
   if(!capturing){setText($('clientMicLevel'),microphoneBusy?'Opening microphone…':'Mic off');setText($('clientMicHint'),'Arm the browser microphone and speak. PTT is not required for this local input meter.');return;}
   if(!fresh||!micMeter.present){setText($('clientMicLevel'),'Waiting for mic samples');setText($('clientMicHint'),audioContext?.state==='running'?'No input samples detected. Check microphone permission and the selected browser microphone.':'Audio is paused. Use Resume audio or arm the microphone again.');return;}
@@ -617,6 +629,101 @@ function installPageLifecycle(){
   document.addEventListener?.('visibilitychange',()=>{if(!document.hidden){wake();microphonePageReturned();}});
 }
 async function exportCsv(){if(!state)return;const cell=value=>'"'+String(value??'').replace(/"/g,'""')+'"',utc=new Date().toISOString();const rows=[['Name','Group','Hamlib ID','Value','Raw value','Access','Range','Status','VFO','UTC']];state.vfos.forEach((vfo,index)=>{const name=index?'B':'A';for(const [field,label,valid,reading]of [['frequency','frequency (Hz)',vfo.frequencyValid,String(vfo.frequency)],['mode','mode / width',vfo.modeValid,vfo.mode+' / '+vfo.width]])rows.push(['VFO '+name+' '+label,'Radio / VFO','VFO'+name+'.'+field,valid?reading:'',valid?reading:'','Read / write','',valid?'Live':'Unavailable',name,utc]);});for(const item of state.settings)rows.push([item.name,item.group,item.id,item.valid?item.display:'',item.valid?item.value:'',item.writable?'Read / write':'Read only',item.range,item.status,state.settingsVfo,utc]);const blob=new Blob(['\ufeff'+rows.map(row=>row.map(cell).join(',')).join('\r\n')],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),link=element('a');link.href=url;link.download='FT710-settings.csv';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+function closePhoneSheet(){
+  const sheet=$('phoneSheet');
+  if(!phonePanelName)return;
+  for(const node of [...$('phoneSheetBody').children])phoneStash.append(node);
+  phonePanelName='';$('phoneShade').hidden=true;if(sheet.open)sheet.close();
+  phoneReturnFocus?.focus?.({preventScroll:true});phoneReturnFocus=null;
+}
+function openPhoneSheet(name){
+  if(!phoneMedia?.matches||!phonePanels.has(name))return;
+  closePhoneSheet();phoneReturnFocus=document.activeElement;
+  const [title,nodes]=phonePanels.get(name);phonePanelName=name;
+  setText($('phoneSheetTitle'),title);
+  for(const node of nodes){$('phoneSheetBody').append(node);if(node.tagName==='DETAILS')node.open=true;}
+  $('phoneShade').hidden=false;$('phoneSheet').show();
+}
+function phoneMove(node,destination){
+  const anchor=document.createComment('desktop control position');node.before(anchor);
+  phoneMoves.push({node,anchor});destination.append(node);return node;
+}
+function applyPhoneLayout(){
+  closePhoneSheet();
+  if(!phoneMedia.matches){
+    for(const {node,anchor}of phoneMoves){anchor.replaceWith(node);}phoneMoves.length=0;phonePanels.clear();
+    if(activePage==='more')showPage('dashboard');
+    updateStickyNavigation();scheduleScopes();return;
+  }
+  const panel=(name,title,nodes)=>{phonePanels.set(name,[title,nodes.map(node=>phoneMove(node,phoneStash))]);};
+  panel('frequency','Enter frequency',[$('frequencyForm')]);
+  panel('mode','Mode & filter',[$('mode').closest('label'),$('filterForm')]);
+  panel('meters','Radio meters',[$('meters')]);
+  panel('gains','Receiver & transmit levels',[$('quickGains').closest('.panel')]);
+  panel('receiver','Receiver controls',[$('functions').closest('.panel')]);
+  panel('connection','Station connection & CAT',[$('connectionPanel')]);
+  panel('rf','RF span & waterfall level',[$('rfControlPanel')]);
+  panel('audio','Listening & microphone levels',[$('browserVolume').closest('label'),$('browserBoostDb').closest('label'),$('browserMicBoostDb').closest('label')]);
+  for(const node of [$('down'),$('step').closest('label'),$('up')])phoneMove(node,$('phoneTuneRow'));
+  for(const id of ['powerOn','powerOff'])phoneMove($(id),$('phonePower'));
+  for(const node of [document.querySelector('.preferences-state'),document.querySelector('.station-diagnostics'),document.querySelector('main>footer')])phoneMove(node,$('more'));
+  phoneMove(document.querySelector('.audio-recovery'),$('audio'));
+  phoneMove($('rfApplyStatus'),$('rfScope'));
+  renderPhone();renderPhoneAudio();updateStickyNavigation();scheduleScopes();
+}
+function renderPhoneAudio(){
+  if(!phoneMedia?.matches||!state)return;
+  setText($('phoneListen'),!$('resumeAudio').hidden?'Resume':listening?'Listen on':'Listen');
+  const unavailable=closing||socket?.readyState!==1||!state.online;
+  $('phoneListen').disabled=listeningBusy||unavailable;
+  $('phoneListen').classList.toggle('selected',listening);
+  setText($('phoneMicText'),microphoneBusy?'Mic…':microphone?'Mic on':'Mic');
+  $('phoneMic').disabled=microphoneBusy||!browserMicAvailable()||unavailable;
+  $('phoneMic').classList.toggle('selected',microphone);
+  $('phoneMic').setAttribute('aria-label',microphone?'Disarm browser microphone':'Arm browser microphone');
+}
+function renderPhone(){
+  if(!phoneMedia?.matches||!state)return;
+  const b=state.activeVfo==='B',active=state.vfos[b?1:0],other=state.vfos[b?0:1],live=state.online&&!state.busy;
+  if(state.releasePending)setText($('ptt'),'Releasing…');
+  else if(state.pttPending&&!state.dashboardPtt)setText($('ptt'),'Starting…');
+  if(state.pttKnown&&state.transmitting&&!state.dashboardPtt&&!state.pttPending)setText($('mobileTxStatus'),'External TX · radio / another CAT client');
+  setText($('phoneVfoName'),`VFO ${b?'B':'A'} · ${active.frequencyValid?band(active.frequency):'Waiting'} · tap to enter`);
+  setText($('phoneFrequencyValue'),active.frequencyValid?frequency(active.frequency):'--.---.---');
+  setText($('phoneOtherName'),`Use ${b?'A':'B'}`);setText($('phoneOtherFrequency'),other.frequencyValid?frequency(other.frequency):'--.---.---');
+  $('phoneFrequency').disabled=$('phoneOtherVfo').disabled=$('phoneMode').disabled=!live;
+  setText($('phoneMode'),active.modeValid?active.mode:'Mode');
+  const specs=state.pttKnown&&state.transmitting?[1,2,3]:[0,5],strip=$('phoneMeterStrip');
+  if(strip.dataset.meters!==specs.join(',')){
+    strip.replaceChildren(...specs.map(index=>{const cell=element('span',undefined,'phone-meter');cell.append(element('small',meterSpecs[index][1]),element('b','--'),element('span',undefined,'meter-bar'));cell.lastChild.append(element('i'));return cell;}));strip.dataset.meters=specs.join(',');
+  }
+  specs.forEach((index,i)=>{const cell=strip.children[i],source=meterElements[index];setText(cell.children[1],source.output.textContent);cell.lastChild.firstChild.style.width=source.fill.style.width;});
+  for(const [name,id]of [['preamp','phonePreamp'],['dnr','phoneDnr'],['nb','phoneNb']]){
+    const current=cycleControlState(name);setText($(id),current.label.replace('Preamp: ',''));$(id).disabled=!live||!current.enabled;$(id).classList.toggle('selected',current.selected);
+  }
+  const tuner=setting('func.TUNER');$('phoneTuner').disabled=!live||!tuner?.valid||!tuner.writable;$('phoneTuner').classList.toggle('selected',!!tuner?.valid&&tuner.value!=='0');
+  renderPhoneAudio();
+}
+function setupPhone(){
+  phoneMedia=window.matchMedia('(max-width: 650px)');phoneStash=element('div');phoneStash.hidden=true;$('app').append(phoneStash);
+  const dock=element('div',undefined,'phone-dock-audio'),listenButton=element('button','Listen');listenButton.id='phoneListen';
+  const mic=element('button'),micText=element('span','Mic'),peak=element('meter');mic.id='phoneMic';micText.id='phoneMicText';peak.id='phoneMicPeak';peak.min=0;peak.max=1;peak.setAttribute('aria-label','Local microphone level');mic.append(micText,peak);
+  const levels=element('button','Levels');levels.setAttribute('data-phone-sheet','audio');dock.append(listenButton,mic,levels);$('mobilePttBar').prepend(dock);
+  listenButton.addEventListener('click',protect(()=>!$('resumeAudio').hidden?$('resumeAudio').click():listen()));mic.addEventListener('click',protect(()=>armMicrophone()));
+  document.querySelectorAll('[data-phone-sheet]').forEach(button=>button.addEventListener('click',()=>openPhoneSheet(button.dataset.phoneSheet)));
+  $('phoneSheetClose').addEventListener('click',closePhoneSheet);
+  $('phoneShade').addEventListener('click',closePhoneSheet);
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&phonePanelName){event.preventDefault();closePhoneSheet();}});
+  $('phoneSheet').addEventListener('cancel',event=>{event.preventDefault();closePhoneSheet();});
+  $('phoneSheet').addEventListener('click',event=>{if(event.target===$('phoneSheet')){const rect=event.target.getBoundingClientRect();if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)closePhoneSheet();}});
+  $('phoneFrequency').addEventListener('click',()=>{tuningQueue.clear();$('controlVfo').value=state.activeVfo;dirty.delete('frequency');const active=state.vfos[state.activeVfo==='B'?1:0];$('frequency').value=active.frequencyValid?(active.frequency/1e6).toFixed(6):'';openPhoneSheet('frequency');$('frequency').focus();$('frequency').select();});
+  $('phoneOtherVfo').addEventListener('click',protect(()=>{$('controlVfo').value=state.activeVfo==='B'?'A':'B';dirty.delete('frequency');dirty.delete('width');return command('vfo',{vfo:$('controlVfo').value},'controlVfo');}));
+  for(const [name,id]of [['preamp','phonePreamp'],['dnr','phoneDnr'],['nb','phoneNb']])$(id).addEventListener('click',protect(()=>cycleControl(name)));
+  $('phoneTuner').addEventListener('click',protect(tunerClick));
+  $('phoneTuner').addEventListener('dblclick',event=>event.preventDefault());$('phoneTuner').style.touchAction='manipulation';
+  $('phoneTuner').title='Tap: tuner on/off. Double-tap: tuning cycle (transmits a tuning carrier).';
+  phoneMedia.addEventListener?.('change',applyPhoneLayout);applyPhoneLayout();
+}
 function setup(){
   preferenceSaver=new PreferenceSaver(readStationPreferences,fields=>command('preferences',fields),key=>dirty.delete(key),(text,failed)=>{setText($('preferenceStatus'),text);$('retryPreferences').hidden=!failed;});
   $('retryPreferences').addEventListener('click',()=>preferenceSaver.flush());
@@ -637,9 +744,9 @@ function setup(){
   $('connectionKind').addEventListener('change',()=>{const before=$('endpoint').value;if($('connectionKind').value==='1'&&!before.includes(':'))$('endpoint').value='127.0.0.1:4532';if($('connectionKind').value==='0'&&before.includes(':'))$('endpoint').value='COM3';if(before!==$('endpoint').value){dirty.add('endpoint');preferenceSaver.edit('endpoint');}});
   $('saveSharing').addEventListener('click',protect(async()=>{await command('sharing',{enabled:$('shareEnabled').checked?'1':'0',port:$('sharePort').value});dirty.delete('shareEnabled');dirty.delete('sharePort');}));
   $('ptt').addEventListener('click',protect(()=>command('ptt',{enabled:state.dashboardPtt||state.pttPending?'0':'1'})));
-  $('frequencyForm').addEventListener('submit',protect(event=>{event.preventDefault();return command('frequency',{vfo:$('controlVfo').value,hz:String(parseFrequencyInput($('frequency').value))},'frequency');}));
+  $('frequencyForm').addEventListener('submit',protect(async event=>{event.preventDefault();tuningQueue.clear();await command('frequency',{vfo:$('controlVfo').value,hz:String(parseFrequencyInput($('frequency').value))},'frequency');closePhoneSheet();}));
   $('mode').addEventListener('change',protect(async()=>{dirty.delete('width');edits.set('width',{revision:null,until:Date.now()+12000});try{const ack=await command('mode',{vfo:$('controlVfo').value,mode:$('mode').value,width:'0'},'mode');const edit=edits.get('width');if(edit)edit.revision=ack.revision||0;}catch(error){edits.delete('width');throw error;}}));
-  $('filterForm').addEventListener('submit',protect(event=>{event.preventDefault();return command('mode',{vfo:$('controlVfo').value,mode:$('mode').value,width:$('width').value},'width');}));
+  $('filterForm').addEventListener('submit',protect(async event=>{event.preventDefault();await command('mode',{vfo:$('controlVfo').value,mode:$('mode').value,width:$('width').value},'width');closePhoneSheet();}));
   $('controlVfo').addEventListener('change',protect(()=>{dirty.delete('frequency');dirty.delete('width');return command('vfo',{vfo:$('controlVfo').value},'controlVfo');}));
   const tune=(steps,target=$('controlVfo').value)=>{if(!state?.online||state.busy||!steps)return;dirty.delete('frequency');return command('step',{vfo:target,hz:String(steps*Number($('step').value))},'frequency');};
   $('up').addEventListener('click',protect(()=>tune(1)));$('down').addEventListener('click',protect(()=>tune(-1)));
@@ -691,7 +798,7 @@ function setup(){
   navigator.mediaDevices?.addEventListener?.('devicechange',()=>{browserDevices().catch(()=>{});updateDiagnostics();});
   navigator.audioSession?.addEventListener?.('statechange',()=>{if(navigator.audioSession.state==='interrupted')audioInterrupted('Phone audio interrupted. Tap Resume audio.',true);});
   document.addEventListener('visibilitychange',()=>{if(document.hidden)cancelTunerClick();subscribeScopes();if(document.hidden&&(microphone||microphoneBusy))audioInterrupted('Microphone disarmed while the page was hidden. Arm it again to transmit.');else scheduleScopes();});
-  installPageLifecycle();
+  setupPhone();installPageLifecycle();
   setInterval(()=>setText($('clock'),new Date().toISOString().slice(11,19)+' UTC'),1000);
   const code=new URLSearchParams(location.hash.slice(1)).get('code');if(code){$('accessCode').value=code;history.replaceState(null,'',location.pathname);}
   fetch('/api/state').then(reply=>{if(reply.ok){closing=false;connectWeb();}}).catch(()=>{});

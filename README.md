@@ -153,6 +153,16 @@ If HTTPS hangs while HTTP setup opens, make sure you are running version 2.0.5 o
 
 On iPhone, allow microphone access when **Arm browser microphone** requests it. Safari uses the phone's system audio output; choose the speaker or headset using the phone's audio controls. Receive playback can use scheduled Web Audio buffers when AudioWorklet is unavailable, but microphone capture requires AudioWorklet support.
 
+### Phone operating screen
+
+On screens up to 650 pixels wide, **Operate** keeps the RF spectrum/waterfall, active VFO, tuning step, mode, meters and receiver shortcuts together. Tap the large frequency to enter a value using the phone keyboard; tap the smaller VFO to switch. Mode/filter, all meters, gains and receiver controls open in panels above the audio/PTT dock. Tap **Done** or outside the panel to return without changing your page position.
+
+The meter strip shows signal/supply in RX and RF output/SWR/ALC in TX; tap it for all meters. **Listen**, **Mic**, **Levels** and PTT stay at the bottom, including while a control panel is open. The mic indicator measures local capture without requiring PTT. **Audio** contains device setup; **Settings** contains the full driver controls; **More** contains power, connection/CAT sharing, scope settings, diagnostics and the full scopes. Wider screens restore the desktop layout using the same controls.
+
+An optional headless layout regression is available as `node tests/mobile_layout_checks.cjs` with Playwright and its Chromium browser installed. `CHROME_PATH` can select an existing Chromium/Chrome executable. It uses synthetic state and intercepts every command, so it never accesses the station. Screenshots are written under `artifacts/mobile-layout/`.
+
+If Windows reserves the offline web fixture's default port 18888, configure another test port with `cmake -S . -B build -DFT710_TEST_WEB_PORT=28888`. This changes only the loopback test fixture; the application still serves the dashboard on port 8888.
+
 ### Map radio audio to the browser
 
 On the web page, open **Audio routing**:
